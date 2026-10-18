@@ -1,0 +1,53 @@
+[project]
+name = "musicset"
+version = "0.1.0"
+description = "Score datasets for optical music recognition: rendering, annotation, augmentation and synthesis"
+readme = "README.md"
+license = { text = "AGPL-3.0-only" }
+authors = [{ name = "pedrogasg", email = "pedrogas_g@hotmail.com" }]
+requires-python = ">=3.13"
+dependencies = [
+    "cairosvg>=2.8.2",
+    "pillow>=11.0.0",
+    "svgpathtools>=1.7.2",
+    "tqdm>=4.67.0",
+    "verovio>=6.3.0",
+]
+
+[project.scripts]
+musicset = "musicset.cli:main"
+
+[project.optional-dependencies]
+viz = [
+    "networkx>=3.2",
+    "pyside6>=6.8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "ruff>=0.15.0",
+    "ty>=0.0.18",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# upstream code, kept verbatim so updates stay a plain copy
+extend-exclude = ["src/musicset/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PTH"]
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.src]
+exclude = ["src/musicset/vendor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
