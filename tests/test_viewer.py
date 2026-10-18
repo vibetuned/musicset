@@ -113,9 +113,55 @@ def test_structure_nodes_are_glyphs_with_labels(dataset: Path):
     tab.node_style.setCurrentText("dot")
     assert tab.items[note.node_id].pos() == moved
 
-    for layout in ("spring", "page", "ForceAtlas2"):
+    for layout in ("tree", "radial", "spring", "page", "ForceAtlas2"):
         tab.layout_choice.setCurrentText(layout)
         assert len(tab.items) == tab.subgraph.number_of_nodes()
     tab.node_style.setCurrentText("crop")
     assert tab.items
     app.processEvents()
+
+
+def test_layout_changes_and_drags_update_positions_and_scroll_area(dataset: Path):
+    from PySide6.QtCore import QPointF
+
+    app = QApplication.instance() or QApplication([])
+    window = Viewer(Dataset(dataset, LabelSet.load("lite")))
+    window.resize(1000, 700)
+    window.show()
+    window.tabs.setCurrentIndex(1)
+    tab = window.structure
+    tab.layout_choice.setCurrentText("ForceAtlas2")
+    node_id = next(iter(tab.items))
+
+    def where() -> dict:
+        return {n: (round(i.pos().x(), 3), round(i.pos().y(), 3)) for n, i in tab.items.items()}
+
+    # re-running the layout gives a new arrangement and forgets drags
+    first = where()
+    tab.items[node_id].setPos(5000, 5000)
+    tab.relayout()
+    assert where() != first and tab.items[node_id].pos() != QPointF(5000, 5000)
+
+    # another layout replaces every position, dragged nodes included
+    tab.items[node_id].setPos(-3000, 7000)
+    tab.layout_choice.setCurrentText("page")
+    page = where()
+    expected = {n: (round(p.x(), 3), round(p.y(), 3)) for n, p in tab._layout(tab.subgraph).items()}
+    assert page == expected
+    tab.layout_choice.setCurrentText("ForceAtlas2")
+    assert where() != page
+
+    # a node dragged out stays reachable: the scene grows and the scrollbars with it
+    tab.view.zoomed = True
+    tab.view.resetTransform()
+    tab.view.scale(2.0, 2.0)
+    app.processEvents()
+    before = tab.view.horizontalScrollBar().maximum()
+    item = tab.items[node_id]
+    item.setPos(tab.scene.sceneRect().right() + 2000, item.pos().y())
+    app.processEvents()
+    assert tab.scene.sceneRect().contains(item.sceneBoundingRect())
+    assert tab.view.horizontalScrollBar().maximum() > before
+    tab.view.centerOn(item)
+    app.processEvents()
+    assert tab.view.mapToScene(tab.view.viewport().rect()).boundingRect().contains(item.pos())

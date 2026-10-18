@@ -1,10 +1,10 @@
 """Structure tab: a score's graph as a network, nodes drawn as their glyphs.
 
-Layouts: ForceAtlas2 (networkx), spring, or the nodes' positions on the page.
-Nodes show their SMuFL glyph (or their crop from the page image, or a dot)
-with a label; hovering a node highlights its neighbours, dragging moves it
-with its edges. Filters by connected component, degree and size; the shown
-subgraph exports as JSON.
+Layouts: tidy tree or radial tree (rooted at ``system-staff``), ForceAtlas2,
+spring, or the nodes' positions on the page. Nodes show their SMuFL glyph (or
+their crop from the page image, or a dot) with a label; hovering a node
+highlights its neighbours, dragging moves it with its edges. Filters by
+connected component, degree and size; the shown subgraph exports as JSON.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ DRAWN = {"beam8", "beam16", "beam32", "beamBroken", "slur", "tie"}
 MUSIC_FONTS = ("Bravura", "Leipzig", "Leland", "Petaluma", "Gootville")
 LABELS = ("class", "id", "class + id", "none")
 STYLES = ("glyph", "crop", "dot")
-LAYOUTS = ("ForceAtlas2", "spring", "page")
+LAYOUTS = ("tree", "radial", "ForceAtlas2", "spring", "page")
 
 
 def _music_font() -> str | None:
@@ -155,6 +155,7 @@ class NodeItem(QGraphicsItemGroup):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             for edge in self.edges:
                 edge.refresh()
+            self.tab.node_moved(self)
         return super().itemChange(change, value)
 
     def hoverEnterEvent(self, event: Any) -> None:
@@ -223,6 +224,8 @@ class StructureTab(QWidget):
         self.edges: list[EdgeItem] = []
         self.positions: dict[str, QPointF] = {}
         self._layout_key: tuple | None = None
+        self._layout_seed = 0
+        self._drawing = False
         self._crops: dict[str, Image.Image] = {}
 
         controls = QWidget()
@@ -332,6 +335,10 @@ class StructureTab(QWidget):
         if not nodes:
             return {}
         kind = self.layout_choice.currentText()
+        if kind == "tree":
+            return self._tree_layout(sub)
+        if kind == "radial":
+            return self._radial_layout(sub)
         if kind == "page":
             # where the objects are on the page, pages stacked downwards
             heights = {}
@@ -355,15 +362,195 @@ class StructureTab(QWidget):
                 # 160-node score graph the extent drops from 128 to 10 edge
                 # lengths with fewer collisions than the defaults
                 raw = nx.forceatlas2_layout(
-                    undirected, max_iter=300, seed=0, distributed_action=True, strong_gravity=True
+                    undirected,
+                    max_iter=300,
+                    seed=self._layout_seed,
+                    distributed_action=True,
+                    strong_gravity=True,
                 )
             else:
-                raw = nx.spring_layout(undirected, seed=0)
+                raw = nx.spring_layout(undirected, seed=self._layout_seed)
             pos = {n: (float(p[0]), float(p[1])) for n, p in raw.items()}
             scale = self._edge_scale(sub, pos)
             pos = self._declutter({n: (x * scale, y * scale) for n, (x, y) in pos.items()})
             return {n: QPointF(x, y) for n, (x, y) in pos.items()}
         return {n: QPointF(x * scale, y * scale) for n, (x, y) in pos.items()}
+
+    @staticmethod
+    def _node_order(sub: nx.DiGraph, node_id: str) -> tuple[int, int, float, float, float, str]:
+        """Score reading order: staves/systems top-to-bottom, events left-to-right."""
+        attrs = sub.nodes[node_id]
+        cls = attrs.get("cls", "?")
+        page = attrs.get("page", 0)
+        b = attrs.get("bbox") or [0, 0, 0, 0]
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        is_layer = 1 if cls == "layer" else 0
+        primary = cy if cls in ("system", "system-staff", "staff", "layer") else cx
+        return (is_layer, page, primary, cy, cx, node_id)
+
+    @classmethod
+    def _forest(cls, sub: nx.DiGraph) -> tuple[list[str], dict[str, list[str]]]:
+        """Spanning forest rooted at ``system-staff``, following hierarchy edges first."""
+        order = {n: cls._node_order(sub, n) for n in sub.nodes}
+        kind_rank = {1: 0, 2: 1, 4: 1, 3: 2, 5: 3}
+        candidates = sorted(
+            sub.nodes,
+            key=lambda n: (
+                0 if sub.nodes[n].get("cls") == "system-staff" and sub.in_degree(n) == 0 else 1,
+                sum(1 for _, _, d in sub.in_edges(n, data=True) if d.get("kind") in (1, 2, 4)),
+                sub.in_degree(n),
+                order[n],
+            ),
+        )
+        visited: set[str] = set()
+        children: dict[str, list[str]] = {n: [] for n in sub.nodes}
+        roots: list[str] = []
+        for cand in candidates:
+            if cand in visited:
+                continue
+            roots.append(cand)
+            visited.add(cand)
+            tree_nodes = [cand]
+            queue = [cand]
+            while queue:
+                next_q: list[str] = []
+                for u in queue:
+                    hier = sorted(
+                        (e for e in sub.out_edges(u, data=True) if e[2].get("kind") in (1, 2, 4)),
+                        key=lambda e: (kind_rank.get(e[2].get("kind", 9), 4), order[e[1]]),
+                    )
+                    for _, v, _ in hier:
+                        if v not in visited:
+                            visited.add(v)
+                            children[u].append(v)
+                            tree_nodes.append(v)
+                            next_q.append(v)
+                if not next_q:
+                    for u in tree_nodes:
+                        other = sorted(
+                            (
+                                e
+                                for e in sub.out_edges(u, data=True)
+                                if e[2].get("kind") not in (1, 2, 4)
+                            ),
+                            key=lambda e: (kind_rank.get(e[2].get("kind", 9), 4), order[e[1]]),
+                        )
+                        for _, v, _ in other:
+                            if v not in visited:
+                                visited.add(v)
+                                children[u].append(v)
+                                tree_nodes.append(v)
+                                next_q.append(v)
+                queue = next_q
+        for u in children:
+            children[u].sort(key=lambda v: order[v])
+        return roots, children
+
+    @classmethod
+    def _tidy_subtree(
+        cls, u: str, children: dict[str, list[str]], h_gap: float, v_gap: float
+    ) -> tuple[dict[str, tuple[float, float]], list[float], list[float]]:
+        """Reingold-Tilford contour packing: shifts sibling subtrees to avoid overlap."""
+        kids = children[u]
+        if not kids:
+            return {u: (0.0, 0.0)}, [0.0], [0.0]
+        sub_pos, left, right = cls._tidy_subtree(kids[0], children, h_gap, v_gap)
+        child_xs = [0.0]
+        for c in kids[1:]:
+            c_pos, c_left, c_right = cls._tidy_subtree(c, children, h_gap, v_gap)
+            overlap = min(len(right), len(c_left))
+            dx = max(right[d] - c_left[d] + h_gap for d in range(overlap))
+            child_xs.append(dx)
+            for n, (x, y) in c_pos.items():
+                sub_pos[n] = (x + dx, y)
+            if len(c_left) > len(left):
+                left.extend(c_left[d] + dx for d in range(len(left), len(c_left)))
+            for d, rx in enumerate(c_right):
+                if d < len(right):
+                    right[d] = rx + dx
+                else:
+                    right.append(rx + dx)
+        mid = 0.5 * (child_xs[0] + child_xs[-1])
+        pos = {u: (0.0, 0.0)}
+        for n, (x, y) in sub_pos.items():
+            pos[n] = (x - mid, y + v_gap)
+        return pos, [0.0, *(x - mid for x in left)], [0.0, *(x - mid for x in right)]
+
+    @classmethod
+    def _tree_layout(cls, sub: nx.DiGraph) -> dict[str, QPointF]:
+        """Top-down Reingold-Tilford tidy tree per system, stacked in score order."""
+        roots, children = cls._forest(sub)
+        h_gap, v_gap = 2.8 * RADIUS, 4.5 * RADIUS
+        pos: dict[str, QPointF] = {}
+        y_offset = 0.0
+        singletons: list[str] = []
+        for r in roots:
+            if not children[r]:
+                singletons.append(r)
+                continue
+            t_pos, left, _ = cls._tidy_subtree(r, children, h_gap, v_gap)
+            min_x = min(left)
+            for n, (x, y) in t_pos.items():
+                pos[n] = QPointF(x - min_x, y + y_offset)
+            y_offset += (len(left) + 1.5) * v_gap
+        for i, r in enumerate(singletons):
+            pos[r] = QPointF((i % 16) * h_gap, y_offset + (i // 16) * v_gap)
+        return pos
+
+    @classmethod
+    def _radial_layout(cls, sub: nx.DiGraph) -> dict[str, QPointF]:
+        """Depth-weighted radial tree with ``system-staff`` at the hub."""
+        roots, children = cls._forest(sub)
+        h_gap, v_gap = 2.8 * RADIUS, 4.2 * RADIUS
+        pos: dict[str, QPointF] = {}
+        depth: dict[str, int] = {}
+        weight: dict[str, float] = {}
+
+        def get_depth(u: str, d: int = 0) -> int:
+            depth[u] = d
+            return max((get_depth(c, d + 1) for c in children[u]), default=d)
+
+        def get_weight(u: str, max_d: int) -> float:
+            d = max(1, depth[u])
+            w = sum(get_weight(c, max_d) for c in children[u])
+            weight[u] = max(max_d / d, w)
+            return weight[u]
+
+        def place(u: str, a0: float, a1: float, cx: float, cy: float, step: float) -> None:
+            d = depth[u]
+            mid = 0.5 * (a0 + a1)
+            rad = d * step
+            pos[u] = (
+                QPointF(cx + rad * math.cos(mid), cy + rad * math.sin(mid))
+                if d
+                else QPointF(cx, cy)
+            )
+            kids = children[u]
+            if not kids:
+                return
+            span = a1 - a0
+            w_sum = sum(weight[c] for c in kids)
+            cur = a0
+            for c in kids:
+                da = span * (weight[c] / w_sum)
+                place(c, cur, cur + da, cx, cy, step)
+                cur += da
+
+        y_offset = 0.0
+        singletons: list[str] = []
+        for r in roots:
+            if not children[r]:
+                singletons.append(r)
+                continue
+            max_d = max(1, get_depth(r))
+            total_w = get_weight(r, max_d)
+            step = max(v_gap, h_gap * total_w / (2 * math.pi * max_d))
+            max_r = max_d * step
+            place(r, 0.0, 2 * math.pi, max_r, y_offset + max_r, step)
+            y_offset += 2 * max_r + 2 * v_gap
+        for i, r in enumerate(singletons):
+            pos[r] = QPointF((i % 16) * h_gap, y_offset + (i // 16) * v_gap)
+        return pos
 
     @staticmethod
     def _edge_scale(sub: nx.DiGraph, pos: dict[str, tuple[float, float]]) -> float:
@@ -400,6 +587,8 @@ class StructureTab(QWidget):
         return {n: (x, y) for n, (x, y) in zip(names, pts.tolist(), strict=True)}
 
     def relayout(self) -> None:
+        """A fresh layout: a new seed for the force layouts, dragged nodes reset."""
+        self._layout_seed += 1
         self._layout_key = None
         self.redraw()
 
@@ -410,9 +599,23 @@ class StructureTab(QWidget):
         self.subgraph = self._filtered()
         key = (self.score, frozenset(self.subgraph.nodes), self.layout_choice.currentText())
         if key != self._layout_key:
+            # a new layout replaces every position, dragged ones included, and
+            # gets the view fitted to it
             self.positions = self._layout(self.subgraph)
             self._layout_key = key
+            self.view.zoomed = False
         self.draw()
+
+    def node_moved(self, item: NodeItem) -> None:
+        """Remember a dragged node and keep it inside the scrollable area."""
+        if self._drawing:
+            return
+        self.positions[item.node_id] = QPointF(item.pos())
+        margin = 2 * RADIUS
+        reach = item.sceneBoundingRect().adjusted(-margin, -margin, margin, margin)
+        rect = self.scene.sceneRect()
+        if not rect.contains(reach):
+            self.scene.setSceneRect(rect.united(reach))
 
     # -- drawing --------------------------------------------------------------
 
@@ -488,9 +691,7 @@ class StructureTab(QWidget):
         item.addToGroup(label)
 
     def draw(self) -> None:
-        # keep where the user dragged nodes
-        for node_id, item in self.items.items():
-            self.positions[node_id] = item.pos()
+        """Rebuild the items at ``self.positions`` (dragged positions live there)."""
         self.scene.clear()
         self.items, self.edges = {}, []
         sub = self.subgraph
@@ -498,6 +699,7 @@ class StructureTab(QWidget):
             self.status.setText("no graph for this score")
             return
         style = self.node_style.currentText()
+        self._drawing = True
         for node_id in sub.nodes:
             node = sub.nodes[node_id]
             item = NodeItem(node_id, node["cls"], node["page"], self)
@@ -506,6 +708,7 @@ class StructureTab(QWidget):
             item.setPos(self.positions.get(node_id, QPointF(0, 0)))
             self.scene.addItem(item)
             self.items[node_id] = item
+        self._drawing = False
         for u, v, attrs in sub.edges(data=True):
             edge = EdgeItem(self.items[u], self.items[v], attrs["kind"])
             self.scene.addItem(edge)
