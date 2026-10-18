@@ -19,6 +19,8 @@ from musicset.pipeline import (
     BuildConfig,
     Layout,
     annotate_file,
+    augment_page,
+    augmented_graphs,
     build_score,
     detection_file,
     graph_file,
@@ -121,14 +123,19 @@ def cmd_build(args: argparse.Namespace) -> None:
         max_pages=args.max_pages,
         max_measures_per_system=args.max_measures_per_system,
         max_notes_per_measure=args.max_notes_per_measure,
+        profile=args.profile,
+        seed=args.seed,
+        variants=args.variants,
     )
 
     statuses: Counter[str] = Counter()
     failures = []
-    tasks = [(src, layout, cfg) for src in sources]
+    tasks = [(src, layout, cfg, v) for src in sources for v in range(1, args.variants + 1)]
+    if args.variants == 1:
+        tasks = [(src, layout, cfg, 0) for src in sources]
     results = map_isolated(build_score, tasks, workers=args.workers, timeout=args.timeout)
     with tqdm(total=len(tasks), desc="Building", unit="score") as bar:
-        for (src, _, _), outcome in results:
+        for (src, _, _, _), outcome in results:
             if outcome.ok and outcome.value is not None:
                 statuses[outcome.value.status] += 1
             else:
@@ -202,12 +209,40 @@ def cmd_kern(args: argparse.Namespace) -> None:
     logger.info("wrote %d kern files, %d failed", len(tasks) - len(errors), len(errors))
 
 
+def cmd_augment(args: argparse.Namespace) -> None:
+    imgs = sorted((args.dataset / "imgs").glob("*.png"))
+    tasks = []
+    for img in imgs:
+        ann = args.dataset / "annotations" / f"{img.stem}.json"
+        if ann.exists():
+            tasks.append((img, ann, args.out, args.preset, args.strength, args.seed, args.copies))
+    if not tasks:
+        raise SystemExit(f"no imgs/*.png with annotations/*.json in {args.dataset}")
+    for sub in ("imgs", "annotations", "graphs"):
+        (args.out / sub).mkdir(parents=True, exist_ok=True)
+    results = map_pool(augment_page, tasks, workers=args.workers, chunksize=2)
+    errors = _report(results, len(tasks), "Augmenting", "page")
+    graphs = augmented_graphs(args.dataset, args.out, args.copies)
+    logger.info(
+        "wrote %d augmented pages (%d failed) and %d graphs to %s",
+        (len(tasks) - len(errors)) * args.copies,
+        len(errors),
+        graphs,
+        args.out,
+    )
+
+
 def cmd_view(args: argparse.Namespace) -> None:
     try:
         from musicset.viewer import run
     except ImportError as e:
         raise SystemExit(f"the viewer needs the viz extra: uv add 'musicset[viz]' ({e})") from e
-    run(args.dataset, _labels(args))
+    scans = []
+    if args.scans is not None:
+        scans = sorted(
+            p for p in args.scans.iterdir() if p.suffix.lower() in (".pdf", ".png", ".jpg")
+        )
+    run(args.dataset, _labels(args), scans)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -245,6 +280,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--mei", action="store_true", help="MEI groundtruth (implied by --graph/--kern)")
     p.add_argument("--paginated", action="store_true", help="per-page MusicXML")
     p.add_argument("--abc", action="store_true", help="per-page ABC")
+    p.add_argument(
+        "--profile",
+        choices=("fixed", "varied"),
+        default="fixed",
+        help="varied: sample font, staff size, line weights, spacing, page per score",
+    )
+    p.add_argument("--seed", type=int, default=0, help="seed of the varied profile")
+    p.add_argument("--variants", type=int, default=1, help="engravings per source (varied)")
     p.add_argument("--font", default="Leipzig", choices=available_fonts())
     p.add_argument("--breaks", default="auto", help="Verovio breaks: auto, encoded, none...")
     p.add_argument("--raster-scale", type=float, default=1.0)
@@ -289,9 +332,21 @@ def main(argv: list[str] | None = None) -> None:
     _add_labels_arg(p, required=True)
     p.set_defaults(func=cmd_kern)
 
+    p = sub.add_parser("augment", parents=[common], help="scan-like copies of a built dataset")
+    p.add_argument("dataset", type=Path, help="built dataset (imgs/, annotations/)")
+    p.add_argument("out", type=Path, help="output directory (imgs/, annotations/, graphs/)")
+    p.add_argument("--preset", default="mixed", help="engraved, aged, photo, mixed, clean")
+    p.add_argument("--strength", type=float, default=1.0)
+    p.add_argument("--copies", type=int, default=1, help="augmented copies per page")
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(func=cmd_augment)
+
     p = sub.add_parser("view", help="browse a dataset: pages, boxes, graphs, targets")
     p.add_argument("dataset", type=Path, help="dataset directory (imgs/, annotations/, ...)")
     _add_labels_arg(p)
+    p.add_argument(
+        "--scans", type=Path, help="directory of reference scans (PDF/PNG) to compare with"
+    )
     p.set_defaults(func=cmd_view)
 
     args = parser.parse_args(argv)

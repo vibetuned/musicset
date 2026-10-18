@@ -23,7 +23,7 @@ def sources(tmp_path: Path) -> Path:
 
 def _build(sources: Path, layout: Layout, cfg: BuildConfig):
     layout.create()
-    return build_score((sources / "tiny.musicxml", layout, cfg))
+    return build_score((sources / "tiny.musicxml", layout, cfg, 0))
 
 
 def test_build_writes_every_artifact(sources: Path, tmp_path: Path):
@@ -140,3 +140,17 @@ def test_sources_inside_the_dataset_are_not_mixed_with_outputs(tmp_path: Path):
     for _ in range(2):  # the rerun must not pick up injected/ or paginated/ files
         main(["build", str(dataset), str(dataset), "--workers", "1", "--paginated", "--no-png"])
     assert sorted(p.name for p in (dataset / "manifest").iterdir()) == ["tiny.json"]
+
+
+def test_cli_augment_copies_pages_and_graphs(sources: Path, tmp_path: Path):
+    out = tmp_path / "out"
+    main(["build", str(sources), str(out), "--workers", "1", "--labels", "lite", "--graph"])
+    aug = tmp_path / "aug"
+    main(["augment", str(out), str(aug), "--copies", "2", "--preset", "engraved", "--workers", "1"])
+    for k in (1, 2):
+        record = json.loads((aug / "annotations" / f"tiny__aug{k}_page1.json").read_text())
+        assert record["image"] == f"tiny__aug{k}_page1.png" and record["augment"]["steps"]
+        assert record["annotations"]
+        assert (aug / "imgs" / f"tiny__aug{k}_page1.png").exists()
+        graph = json.loads((aug / "graphs" / f"tiny__aug{k}.json").read_text())
+        assert graph["json_files"] == [f"tiny__aug{k}_page1.json"]

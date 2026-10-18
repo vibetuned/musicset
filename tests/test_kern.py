@@ -37,7 +37,7 @@ def _build(tmp_path: Path, **cfg) -> Layout:
     shutil.copy(FIXTURES / "tiny.musicxml", tmp_path / "src" / "tiny.musicxml")
     layout = Layout(tmp_path / "out")
     layout.create()
-    build_score((tmp_path / "src" / "tiny.musicxml", layout, BuildConfig(**cfg)))
+    build_score((tmp_path / "src" / "tiny.musicxml", layout, BuildConfig(**cfg), 0))
     return layout
 
 

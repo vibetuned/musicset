@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,6 +37,7 @@ from musicset.ids import id_prefix, inject_ids
 from musicset.labels import LabelSet
 from musicset.render.engrave import Engraving, rasterize
 from musicset.render.options import RenderOptions
+from musicset.render.profiles import has_encoded_breaks, sample_render_options
 from musicset.score import MusicXML, read_musicxml, write_mxl
 from musicset.views.abc import AbcError, to_abc
 from musicset.views.detection import ClassMap, detection_record
@@ -44,7 +46,7 @@ from musicset.views.kern import score_kern
 from musicset.views.paginate import page_musicxml
 
 # Bump when extraction output changes for the same SVG, to invalidate builds
-EXTRACTOR_VERSION = 2
+EXTRACTOR_VERSION = 3
 
 PAGE_SUFFIX = ".json.gz"
 
@@ -148,8 +150,19 @@ class BuildConfig:
     max_notes_per_measure: float = 0
     """Reject pages averaging more notes per measure (0: no limit). Sources
     without barlines engrave as one giant measure; kakigori used 40."""
+    profile: str = "fixed"
+    """``fixed``: every score engraved with ``render``. ``varied``: options
+    sampled per score and variant (font, staff size, line weights, spacing,
+    page), reproducibly from ``seed`` (:mod:`musicset.render.profiles`)."""
+    seed: int = 0
+    variants: int = 1
+    """Engravings per source; variant k of score x is named ``x__v<k>``."""
 
     def __post_init__(self) -> None:
+        if self.profile not in ("fixed", "varied"):
+            raise ValueError(f"unknown render profile {self.profile!r}: fixed or varied")
+        if self.variants > 1 and self.profile == "fixed":
+            raise ValueError("several variants of a score need the varied render profile")
         if (self.write_graph or self.write_kern) and (
             self.labels is None or not self.labels.has_graph_roles
         ):
@@ -163,10 +176,22 @@ class BuildConfig:
     def keeps_mei(self) -> bool:
         return self.write_mei or self.needs_edges
 
+    def score_id(self, source: Path, variant: int) -> str:
+        return source.stem if self.variants == 1 else f"{source.stem}__v{variant}"
+
+    def options_for(self, score: str, musicxml: str) -> RenderOptions:
+        """The engraving options of one score (and variant)."""
+        if self.profile == "fixed":
+            return self.render
+        rng = random.Random(f"{self.seed}:{score}")
+        return sample_render_options(rng, self.render, encoded_breaks=has_encoded_breaks(musicxml))
+
     def render_fingerprint(self) -> str:
         payload = json.dumps(
             [
                 self.render.fingerprint(),
+                self.profile,
+                self.seed,
                 self.raster_scale,
                 self.write_svg,
                 self.write_png,
@@ -270,10 +295,10 @@ def _project_labels(
     return info
 
 
-def build_score(task: tuple[Path, Layout, BuildConfig]) -> ScoreReport:
+def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
     """Build every artifact of one score. Runs in an isolated worker process."""
-    source, layout, cfg = task
-    score = source.stem
+    source, layout, cfg, variant = task
+    score = cfg.score_id(source, variant)
     manifest_path = layout.manifest / f"{score}.json"
     render_fp = cfg.render_fingerprint()
     labels_fp = cfg.labels_fingerprint()
@@ -305,7 +330,8 @@ def build_score(task: tuple[Path, Layout, BuildConfig]) -> ScoreReport:
     musicxml.text = inject_ids(musicxml.text, id_prefix(score))
     write_mxl(layout.injected / f"{score}.mxl", musicxml)
 
-    engraving = Engraving.load(musicxml.text, cfg.render)
+    options = cfg.options_for(score, musicxml.text)
+    engraving = Engraving.load(musicxml.text, options)
     if cfg.max_pages and engraving.page_count > cfg.max_pages:
         (layout.injected / f"{score}.mxl").unlink()
         raise Rejected(f"{engraving.page_count} pages > {cfg.max_pages}")
@@ -364,7 +390,8 @@ def build_score(task: tuple[Path, Layout, BuildConfig]) -> ScoreReport:
         "source": str(source),
         "pages": infos,
         "renderer": engraving.version,
-        "render_options": asdict(cfg.render),
+        "render_profile": cfg.profile,
+        "render_options": asdict(options),
         "raster_scale": cfg.raster_scale,
         "render_fingerprint": render_fp,
         "labels": cfg.labels.name if cfg.labels else None,
@@ -419,3 +446,68 @@ def kern_file(task: tuple[Path, list[Path], Path, dict[str, list[str]]]) -> int:
     kern = score_kern(pages, build_edges(mei_path, pages, node_roles), node_roles)
     (out_dir / f"{mei_path.stem}.krn").write_text(kern, encoding="utf-8")
     return kern.count("\n")
+
+
+def augment_page(task: tuple[Path, Path, Path, str, float, int, int]) -> int:
+    """Augmented copies of one page and its detection file; returns copies written.
+
+    Copy k of ``x_page3`` is ``x__aug<k>_page3`` (png + json, boxes moved with
+    the ink, boxes pushed off the page dropped, the applied steps logged).
+    """
+    import io
+    import zlib
+
+    import numpy as np
+    from PIL import Image
+
+    from musicset.augment import Augmenter
+
+    img_path, ann_path, out_root, preset, strength, seed, copies = task
+    record = json.loads(ann_path.read_text(encoding="utf-8"))
+    anns = record["annotations"]
+    boxes = np.array([a["bbox"] for a in anns], dtype=np.float32).reshape(-1, 4)
+    with Image.open(img_path) as im:
+        image = np.asarray(im.convert("RGB"))
+    score, _, number = img_path.stem.rpartition("_page")
+    augmenter = Augmenter(preset, strength)
+    for k in range(1, copies + 1):
+        rng = np.random.default_rng([seed, zlib.crc32(img_path.stem.encode()), k])
+        out = augmenter(image, boxes, rng)
+        stem = f"{score}__aug{k}_page{number}"
+        buf = io.BytesIO()
+        Image.fromarray(out.image).save(buf, format="PNG")
+        (out_root / "imgs" / f"{stem}.png").write_bytes(buf.getvalue())
+        kept = [
+            {**a, "bbox": [round(float(v), 2) for v in b]}
+            for a, b, keep in zip(anns, out.boxes, out.keep, strict=True)
+            if keep
+        ]
+        h, w = out.image.shape[:2]
+        result = {
+            "image": f"{stem}.png",
+            "width": w,
+            "height": h,
+            "annotations": kept,
+            "augment": {"source": img_path.name, "preset": out.preset, "steps": out.log},
+        }
+        _write_json(out_root / "annotations" / f"{stem}.json", result, indent=2)
+    return copies
+
+
+def augmented_graphs(dataset: Path, out_root: Path, copies: int) -> int:
+    """Graph copies for augmented pages: same edges, page files renamed."""
+    written = 0
+    for path in sorted((dataset / "graphs").glob("*.json")):
+        graph = json.loads(path.read_text(encoding="utf-8"))
+        for k in range(1, copies + 1):
+            renamed = [
+                re.sub(r"_page(\d+)\.json$", rf"__aug{k}_page\1.json", f)
+                for f in graph.get("json_files", [])
+            ]
+            if not all((out_root / "annotations" / f).exists() for f in renamed):
+                continue
+            _write_json(
+                out_root / "graphs" / f"{path.stem}__aug{k}.json", {**graph, "json_files": renamed}
+            )
+            written += 1
+    return written

@@ -17,7 +17,10 @@ its numeric behaviour. Known, intentional differences:
   had no 32nd flags, so those stems fell through to ``stem4``);
 * Verovio ``bounding-box`` overlays (option ``svgBoundingBoxes``) are ignored
   instead of being read as ink;
-* malformed text attributes skip that text run instead of the whole page.
+* malformed text attributes skip that text run instead of the whole page;
+* a measure's box covers its staves and barline only, not the control events
+  hanging off it (a long direction could stretch it across the page, which
+  also broke measure order in the kern serializer).
 """
 
 from __future__ import annotations
@@ -60,6 +63,8 @@ _DESC = f"{{{SVG_NS}}}desc"
 _FIRST_MOVE_X = re.compile(r"M([0-9.]+)")
 _NUMBER = re.compile(r"[-+]?[0-9]*\.?[0-9]+")
 
+# Children that make up a measure's own extent
+_MEASURE_BODY = frozenset({"staff", "barLine"})
 # Staff lines closer than this (SVG units, vertically) are merged into one
 # system-staff box
 _SYSTEM_STAFF_MERGE = 1000
@@ -298,16 +303,29 @@ class _Extractor:
 
         full: BBox | None = None
         no_flags: BBox | None = None
+        staves: BBox | None = None
         for child in node:
             child_full, child_no_flags = self._visit(child, element, owner)
             full = union(full, child_full)
-            if "flag" not in _classes(child):
+            child_classes = _classes(child)
+            if "flag" not in child_classes:
                 no_flags = union(no_flags, child_no_flags)
+            if _MEASURE_BODY & set(child_classes):
+                staves = union(staves, child_full)
 
         if index is not None:
-            # Verovio nests the flag inside the stem group; a stem box covers
-            # the stem line only
-            self.elements[index].bbox = no_flags if "stem" in classes else full
+            if "stem" in classes:
+                # Verovio nests the flag inside the stem group; a stem box
+                # covers the stem line only
+                box = no_flags
+            elif "measure" in classes and staves is not None:
+                # A measure is where its staves and barline are; control events
+                # (directions, dynamics, slurs) hang off it and must not stretch
+                # it: a footnote set as a direction ran four page widths right
+                box = staves
+            else:
+                box = full
+            self.elements[index].bbox = box
         return full, no_flags
 
     def _open_element(self, g: ET.Element, classes: list[str], parent: int | None) -> int:
