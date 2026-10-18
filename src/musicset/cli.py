@@ -245,6 +245,114 @@ def cmd_view(args: argparse.Namespace) -> None:
     run(args.dataset, _labels(args), scans)
 
 
+def cmd_synth(args: argparse.Namespace) -> None:
+    import random
+
+    from musicset.synth import SOURCE_KINDS, SynthTask, synthesize
+    from musicset.synth.write import diversity
+
+    options: dict = {}
+    if args.kind == "exercise":
+        options = {
+            "staves": args.staves,
+            "fingerings": False if args.no_fingerings else None,
+            "ornaments": False if args.no_ornaments else None,
+            "dynamics": False if args.no_dynamics else None,
+            "slurs": False if args.no_slurs else None,
+            "ties": False if args.no_ties else None,
+            "meters": args.meters,
+            "contents": tuple(args.contents) if args.contents else None,
+            "min_measures": args.min_measures,
+            "max_measures": args.max_measures,
+        }
+    elif args.kind == "piano":
+        options = {"min_measures": args.min_measures, "max_measures": args.max_measures}
+    elif args.kind == "mutate":
+        options = {"octave_clef": args.octave_clef, "octave_8va": args.octave_8va}
+    options = {k: v for k, v in options.items() if v is not None}
+
+    sources: list[Path] = []
+    if args.kind in SOURCE_KINDS:
+        if args.sources is None:
+            raise SystemExit(f"{args.kind} needs --sources")
+        sources = find_sources(args.sources)
+        random.Random(args.seed).shuffle(sources)
+        if not sources:
+            raise SystemExit(f"no scores under {args.sources}")
+    if args.kind == "counterpoint" and args.pool is None:
+        raise SystemExit("counterpoint needs --pool (see musicset counterpoint-pool)")
+    count = args.count or (len(sources) if sources else 0)
+    if not count:
+        raise SystemExit("how many? -n N")
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    tasks = [
+        SynthTask(
+            kind=args.kind,
+            index=i,
+            out=args.out,
+            seed=args.seed,
+            profile=args.profile,
+            options=tuple(sorted(options.items())),
+            source=sources[i % len(sources)] if sources else None,
+            pool=args.pool,
+        )
+        for i in range(args.start, args.start + count)
+    ]
+    pending = [t for t in tasks if not t.path.exists()]
+    logger.info("%d to generate (%d already present)", len(pending), len(tasks) - len(pending))
+    errors = _report(
+        map_pool(synthesize, pending, workers=args.workers, chunksize=4),
+        len(pending),
+        f"Synthesizing {args.kind}",
+        "score",
+    )
+    distinct, total = diversity(t.path for t in tasks[:3000] if t.path.exists())
+    level = logging.WARNING if total and distinct < 0.9 * total else logging.INFO
+    logger.log(
+        level,
+        "%d failed; %d distinct scores in a sample of %d%s",
+        len(errors),
+        distinct,
+        total,
+        " - these settings cannot vary that much, loosen them" if level == logging.WARNING else "",
+    )
+
+
+def cmd_counterpoint_pool(args: argparse.Namespace) -> None:
+    from musicset.synth.species import compose, load_pool, pool_tasks
+
+    done = {piece["seed"] for piece in load_pool(args.pool)} if args.pool.exists() else set()
+    tasks = pool_tasks(
+        args.count,
+        seed=args.seed,
+        species=tuple(args.species),
+        measures=tuple(args.measures),
+        modes=tuple(args.modes),
+        maxiters=args.maxiters,
+    )
+    pending = [t for t in tasks if t.seed not in done]
+    logger.info(
+        "%d pieces to compose (%d already in the pool)", len(pending), len(tasks) - len(pending)
+    )
+    args.pool.parent.mkdir(parents=True, exist_ok=True)
+    failed = 0
+    with args.pool.open("a", encoding="utf-8") as f:
+        results = map_isolated(
+            compose, pending, workers=args.workers, timeout=args.timeout, retries=0
+        )
+        for task, outcome in tqdm(results, total=len(pending), desc="Composing", unit="piece"):
+            if outcome.ok and outcome.value is not None:
+                f.write(json.dumps(outcome.value) + "\n")
+                f.flush()
+            else:
+                failed += 1
+                logger.warning("seed %d (species %d): %s", task.seed, task.species, outcome.error)
+    logger.info(
+        "pool %s: %d pieces, %d failed", args.pool, len(done) + len(pending) - failed, failed
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--workers", type=int, default=None, help="default: $MUSICSET_WORKERS")
@@ -340,6 +448,54 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--copies", type=int, default=1, help="augmented copies per page")
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(func=cmd_augment)
+
+    p = sub.add_parser("synth", parents=[common], help="generate synthetic MusicXML scores")
+    p.add_argument(
+        "kind",
+        choices=("exercise", "piano", "counterpoint", "easy", "melody", "mutate", "arrange"),
+    )
+    p.add_argument("out", type=Path, help="directory for the .mxl files")
+    p.add_argument(
+        "-n", "--count", type=int, default=0, help="scores (mutate/arrange: one per source)"
+    )
+    p.add_argument("--start", type=int, default=0, help="first index (to extend a batch)")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--profile", default="default", help="notation rates: plain, default, detector")
+    p.add_argument("--pool", type=Path, help="counterpoint pool (.jsonl)")
+    p.add_argument("--sources", type=Path, help="real scores to mutate or arrange")
+    g = p.add_argument_group("exercise")
+    g.add_argument("--staves", type=int, choices=(1, 2))
+    g.add_argument("--no-fingerings", action="store_true")
+    g.add_argument("--no-ornaments", action="store_true", help="nor articulations, arpeggios")
+    g.add_argument("--no-dynamics", action="store_true")
+    g.add_argument("--no-slurs", action="store_true")
+    g.add_argument("--no-ties", action="store_true")
+    g.add_argument("--meters", choices=("simple", "medium", "full", "detector"))
+    g.add_argument(
+        "--contents",
+        nargs="+",
+        choices=("major", "harmonic_minor", "melodic_minor", "chromatic", "chord_progression"),
+    )
+    g = p.add_argument_group("exercise and piano")
+    g.add_argument("--min-measures", type=int)
+    g.add_argument("--max-measures", type=int)
+    g = p.add_argument_group("mutate")
+    g.add_argument("--octave-clef", type=float, help="per-part rate of octave clefs (0.4)")
+    g.add_argument("--octave-8va", type=float, help="share of 8va among them (0.65)")
+    p.set_defaults(func=cmd_synth)
+
+    p = sub.add_parser(
+        "counterpoint-pool", parents=[common], help="compose species counterpoint (slow) for synth"
+    )
+    p.add_argument("pool", type=Path, help=".jsonl file, appended to (resumable)")
+    p.add_argument("-n", "--count", type=int, required=True, help="pieces in the pool")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--species", type=int, nargs="+", default=[1, 2, 3, 4, 5])
+    p.add_argument("--measures", type=int, nargs="+", default=[8, 10, 12])
+    p.add_argument("--modes", nargs="+", default=["major", "minor"], choices=("major", "minor"))
+    p.add_argument("--maxiters", type=int, default=2, help="VNS restarts without improvement")
+    p.add_argument("--timeout", type=float, default=900.0, help="seconds per piece")
+    p.set_defaults(func=cmd_counterpoint_pool)
 
     p = sub.add_parser("view", help="browse a dataset: pages, boxes, graphs, targets")
     p.add_argument("dataset", type=Path, help="dataset directory (imgs/, annotations/, ...)")

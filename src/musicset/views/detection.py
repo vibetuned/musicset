@@ -70,9 +70,31 @@ def _in_key_signature(page: PageAnnotation, glyph: Glyph) -> bool:
     )
 
 
+# Elements that are events: a glyph drawn inside one belongs to it
+_EVENTS = frozenset(("note", "chord", "rest", "mRest", "space"))
+_CONTAINERS = frozenset(("layer", "staff", "measure", "system", "beam", "tuplet"))
+
+
+def _event_parent(page: PageAnnotation, el) -> str | None:
+    """Id of the note, chord or rest an element is drawn inside (its dots,
+    accidental, articulation...), from the SVG nesting."""
+    j = el.parent
+    while j is not None:
+        parent = page.elements[j]
+        if _EVENTS.intersection(parent.classes) and parent.id is not None:
+            return parent.id
+        if _CONTAINERS.intersection(parent.classes):
+            return None
+        j = parent.parent
+    return None
+
+
 def detection_annotations(
     page: PageAnnotation, class_map: ClassMap, image_size: tuple[int, int]
 ) -> list[dict[str, Any]]:
+    """Detection boxes in kakigori's format: ``class``, ``bbox`` (pixels),
+    ``id``, plus ``parent`` (the owning event's id) on elements drawn inside
+    a note, chord or rest; the graph view attaches those by it."""
     width, height = image_size
     sx, sy = width / page.width, height / page.height
     targets = set(class_map.target_classes)
@@ -98,6 +120,8 @@ def detection_annotations(
             ann = {"class": label, "bbox": box}
         if el.id is not None:
             ann["id"] = el.id
+        if not _EVENTS.intersection(el.classes) and (owner := _event_parent(page, el)):
+            ann["parent"] = owner
         out.append(ann)
 
     for glyph in page.glyphs:

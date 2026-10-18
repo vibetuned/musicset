@@ -258,11 +258,18 @@ class _GraphBuilder:
                         self.edges.append((staff["id"], node["id"], 1))
                         break
 
-        # Note -> dots and other attribute-encoded modifiers: nearest event
+        # Note -> dots and other attribute-encoded modifiers: the event the
+        # glyph is drawn inside (detection ``parent``), else the nearest event.
+        # Nearest-by-centre misplaces them in crowded measures: a dotted
+        # eighth's dot lies closer to the next note's centre than to its own
         children = {child for _, child, _ in self.edges}
         events = [n for n in nodes if n.get("class") in temporal and "id" in n]
         for node in nodes:
             if not (node["class"] in modifier and node.get("id") and node["id"] not in children):
+                continue
+            owner = self.node_map.get(node.get("parent", ""))
+            if owner is not None and owner.get("class") in temporal:
+                self.edges.append((owner["id"], node["id"], 2))
                 continue
             n_cx, n_cy = _center(node["bbox"])
             best, best_dist = None, float("inf")
@@ -277,7 +284,19 @@ class _GraphBuilder:
             if best is not None:
                 self.edges.append((best["id"], node["id"], 2))
 
-        # Notehead -> stem: stems exist only in the engraving
+        # Notehead -> stem: stems exist only in the engraving. A stem belongs to
+        # the note (or chord) it is drawn inside (detection ``parent``); only
+        # without one does touching decide, and in a crowded measure a
+        # neighbour's stem touches the head too
+        chord_notes: dict[str, set[str]] = {}
+        for u, v, k in self.edges:
+            if k == 1 and self.node_map.get(u, {}).get("class") == "chord":
+                chord_notes.setdefault(u, set()).add(v)
+
+        def owned_by(head_id: str, owner: str) -> bool:
+            owners = chord_notes.get(owner, set()) | {owner}
+            return any(head_id == o or head_id.startswith(o + "_") for o in owners)
+
         heads = [
             n
             for n in nodes
@@ -301,6 +320,9 @@ class _GraphBuilder:
                 and s[1] <= h["bbox"][3]
                 and s[3] >= h["bbox"][1]
             ]
+            owner = node.get("parent")
+            if owner and (own := [h for h in touching if owned_by(h["id"], owner)]):
+                touching = own
             # Heads at the same height are unisons of different layers
             unisons: dict[int, list[dict[str, Any]]] = {}
             for head in touching:

@@ -47,6 +47,9 @@ from musicset.views.paginate import page_musicxml
 
 # Bump when extraction output changes for the same SVG, to invalidate builds
 EXTRACTOR_VERSION = 3
+# Bump when the detection, graph or kern views change for the same canonical
+# pages: builds re-project them from pages/ and mei/ without rendering
+VIEWS_VERSION = 2
 
 PAGE_SUFFIX = ".json.gz"
 
@@ -210,7 +213,8 @@ class BuildConfig:
     def labels_fingerprint(self) -> str | None:
         if self.labels is None:
             return None
-        return f"{self.labels.fingerprint()}-{int(self.write_graph)}{int(self.write_kern)}"
+        flags = f"{int(self.write_graph)}{int(self.write_kern)}"
+        return f"{self.labels.fingerprint()}-{flags}-v{VIEWS_VERSION}"
 
 
 @dataclass(slots=True)
@@ -225,6 +229,21 @@ def _write_json(path: Path, data: Any, *, indent: int | None = None) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=indent), encoding="utf-8")
     tmp.replace(path)
+
+
+def _overflow(page: PageAnnotation) -> str | None:
+    """A staff drawn past the page edge: Verovio occasionally sets a last
+    system taller than the room left (tall chords stacked with ornaments and
+    fingerings), and its clipped boxes would be groundtruth with notes missing."""
+    for el in page.elements:
+        box = el.bbox
+        if (
+            el.classes[:1] == ("staff",)
+            and box is not None
+            and (box[1] < 0 or box[3] > page.height)
+        ):
+            return f"page {page.page}: a staff runs off the page"
+    return None
 
 
 def _density_violation(page: PageAnnotation, cfg: BuildConfig) -> str | None:
@@ -356,7 +375,7 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
             svg, score=score, page=number, text_ink=raster.text_ink, ink_scale=raster.scale
         )
         page.meta["render_fingerprint"] = render_fp
-        if (violation := _density_violation(page, cfg)) is not None:
+        if (violation := _overflow(page) or _density_violation(page, cfg)) is not None:
             _remove_pages(layout, score)
             (layout.injected / f"{score}.mxl").unlink()
             raise Rejected(violation)

@@ -25,6 +25,9 @@ viz = [
     "networkx>=3.2",
     "pyside6>=6.8",
 ]
+synth = [
+    "music21>=9.9.1",
+]
 
 [dependency-groups]
 dev = [

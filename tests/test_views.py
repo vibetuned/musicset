@@ -115,3 +115,42 @@ def test_page_keeps_its_measures_and_every_staff_clef():
 def test_page_abc():
     abc = to_abc(ET.tostring(slice_page(ET.fromstring(_TWO_STAVES), {"n3"}), encoding="unicode"))
     assert "bass" in abc and "treble" not in abc
+
+
+def test_modifiers_follow_their_drawn_parent():
+    """A dotted eighth's dot can sit nearer the next note's centre in a crowded
+    measure; the detection ``parent`` keeps it on its own note."""
+    from musicset.labels import LabelSet
+    from musicset.views.graph import build_edges
+
+    mei = (
+        '<mei xmlns="http://www.music-encoding.org/ns/mei"><music><body><mdiv><score>'
+        '<section><measure xml:id="m1"><staff xml:id="s1" n="1"><layer xml:id="l1" n="1">'
+        '<note xml:id="n1" dur="8" dots="1" pname="c" oct="5"/>'
+        '<note xml:id="n2" dur="16" pname="d" oct="5"/>'
+        "</layer></staff></measure></section></score></mdiv></body></music></mei>"
+    )
+    page = [
+        {"class": "measure", "bbox": [0, 0, 100, 50], "id": "m1"},
+        {"class": "staff", "bbox": [0, 0, 100, 50], "id": "s1"},
+        {"class": "layer", "bbox": [5, 5, 40, 40], "id": "l1"},
+        {"class": "note", "bbox": [10, 10, 20, 30], "id": "n1"},
+        {"class": "note", "bbox": [19, 10, 29, 30], "id": "n2"},
+        {"class": "dots", "bbox": [22, 18, 24, 20], "id": "d1"},
+    ]
+    roles = LabelSet.load("lite").node_roles
+    assert ("n2", "d1", 2) in build_edges(mei, [page], roles)  # nearest centre
+    page[-1]["parent"] = "n1"
+    edges = build_edges(mei, [page], roles)
+    assert ("n1", "d1", 2) in edges and ("n2", "d1", 2) not in edges
+
+
+def test_detection_view_names_the_owning_event(tiny_page: PageAnnotation):
+    from musicset.labels import LabelSet
+    from musicset.views.detection import detection_annotations
+
+    anns = detection_annotations(tiny_page, LabelSet.load("lite").classes, (1000, 1400))
+    stems = [a for a in anns if a["class"].startswith("stem")]
+    notes = {a["id"] for a in anns if a["class"] in ("note", "chord")}
+    assert stems and all(a.get("parent") in notes for a in stems)
+    assert not any("parent" in a for a in anns if a["class"] in ("note", "chord", "staff"))

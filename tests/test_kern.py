@@ -79,3 +79,34 @@ def test_opening_signature_is_the_leftmost_on_the_staff():
     }
     order = ["change", "elsewhere", "opening"]
     assert Spine._leftmost_on_staff("metersig", staff, order, nodes) == "opening"
+
+
+def test_geometric_slices_never_merge_one_layer():
+    """Closely set notes of one layer are a run, not a chord; other layers at
+    the same x still share the row."""
+    from musicset.views.kern import HumdrumContext, Measure
+
+    m = Measure("m")
+    for i, token in enumerate(("12cc", "12cc", "12cc")):
+        m.add(token, 1 / 12, 100.0 + 12 * i, f"n{i}", "layer1")
+    m.add("4e", 0.25, 101.0, "v2", "layer2")
+    slices, _ = HumdrumContext._slices_from_geometry([m])
+    assert [row[0] for row in slices] == [["12cc", "4e"], ["12cc"], ["12cc"]]
+
+
+def test_tuplet_ratio_from_written_total():
+    def ratio(durations, dots=None):
+        events = [{"id": str(i)} for i in range(len(durations))]
+        infos = [
+            {"duration": d, "dots": (dots or [0] * len(durations))[i]}
+            for i, d in enumerate(durations)
+        ]
+        tuplet_of = {e["id"]: "t" for e in events}
+        return MinimalHumdrumSerializer._tuplet_ratios(events, infos, tuplet_of).get("0")
+
+    assert ratio([8, 16, 16, 8]) == (3, 2)  # 3/8, four events
+    assert ratio([4, 8]) == (3, 2)  # quarter-eighth triplet, two events
+    assert ratio([8, 8, 16]) == (3, 2)  # one misread notehead
+    assert ratio([16] * 5) == (5, 4)
+    assert ratio([16] * 6) == (3, 2)  # sextuplet: same durations as 3:2
+    assert ratio([8, 8]) is None  # nothing to read

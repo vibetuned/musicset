@@ -21,12 +21,29 @@ runs with Python's string hashing, 19-20 of 201 validation-small files):
   score opened as ``*M1/8 *M3/4``);
 * :func:`score_kern` feeds nodes in document order.
 
-Pitch/rhythm scores against MEI are unchanged (validation-test 99.93/99.88,
-validation-small 98.34/97.64, validation-lite 98.42/97.90).
+Pitch/rhythm scores against MEI were unchanged by those (validation-test
+99.93/99.88, validation-small 98.34/97.64, validation-lite 98.42/97.90).
+
+Fixes found on synthetic scores, whose crowded measures and mixed tuplets the
+real sets rarely show:
+
+* the geometric slicing never puts two events of one staff and layer in the
+  same row (closely set noteheads became one kern chord);
+* tuplet ratios come from the written total (eighth, two sixteenths and an
+  eighth = 3/8: a triplet), not the event count (4:2 for that one; nothing
+  for a quarter-eighth triplet).
+
+Dots, accidentals, articulations and stems belong to the event the
+engraving draws them inside (the detection view's ``parent``), not the
+nearest one: see :mod:`musicset.views.graph`. Together: validation-small
+rhythm 97.64 -> 97.71, validation-lite 466 -> 467 perfect files, mutated
+real scores 88.9 -> 98.0 rhythm.
 """
 
 import itertools
 import logging
+from dataclasses import dataclass, field
+from fractions import Fraction
 
 logger = logging.getLogger(__name__)
 
@@ -269,18 +286,20 @@ class Measure:
         self.durations = []  # Duration in whole-note units, parallel to tokens
         self.cxs = []  # Spatial x-coordinates, parallel to tokens
         self.ids = []  # Graph node IDs, parallel to tokens
+        self.voices = []  # Layer node IDs (None when unknown), parallel to tokens
         self.full_measure_rest = False  # Lone whole/measure rest fills this measure
         self.dynamics = []  # (cx, text) dynamic markings assigned to this staff
         self.dynam_tokens = None  # **dynam rows, aligned with tokens after sync
         self.pedals = []  # (cx, '*ped'/'*Xped') pedal marks assigned to this staff
         self.interps = []  # (cx, token) mid-piece clef/key/meter change rows
 
-    def add(self, token: str, duration: float = 0.25, cx: float = 0.0, node_id=None):
+    def add(self, token: str, duration: float = 0.25, cx: float = 0.0, node_id=None, voice=None):
         """Add a note/rest token with its duration (in whole-note units)."""
         self.tokens.append(token)
         self.durations.append(duration)
         self.cxs.append(cx)
         self.ids.append(node_id)
+        self.voices.append(voice)
 
     def build(self) -> list:
         """Return the tokens for this measure. Uses null token if empty."""
@@ -568,6 +587,16 @@ class Spine:
             return 4, 4
 
 
+@dataclass
+class _Slice:
+    """Events clustered into one time slice by the geometric fallback."""
+
+    start: float
+    cxs: list[float] = field(default_factory=list)
+    members: list[tuple[int, int]] = field(default_factory=list)  # (spine, token index)
+    voices: set[tuple[int, object]] = field(default_factory=set)  # (spine, layer)
+
+
 class HumdrumContext:
     """Manages the collection of spines and handles the final text rendering."""
 
@@ -646,32 +675,48 @@ class HumdrumContext:
     def _slices_from_geometry(measures: list):
         """Fallback: cluster events into time slices by horizontal proximity.
 
+        Two events of the same staff and layer are consecutive, never
+        simultaneous, so they never share a slice however close they are drawn:
+        in a crowded measure Verovio sets noteheads closer than the tolerance
+        (even overlapping), and joining them made one kern chord of a run.
+        Events of other layers and staves still cluster by position.
+
         Returns (slices, slice_cxs) like _slices_from_sync.
         """
         TOLERANCE = 30.0  # Pixels. Events within this horizontal distance sync up.
 
-        all_cxs = sorted(cx for m in measures for cx in m.cxs)
-        if not all_cxs:
+        items = sorted(
+            (cx, s_idx, i) for s_idx, m in enumerate(measures) for i, cx in enumerate(m.cxs)
+        )
+        if not items:
             return [[[] for _ in measures]], [0.0]
 
-        clusters = []
-        current_cluster = [all_cxs[0]]
-        for cx in all_cxs[1:]:
-            if cx - current_cluster[0] <= TOLERANCE:
-                current_cluster.append(cx)
+        clusters: list[_Slice] = []
+        for cx, s_idx, i in items:
+            m = measures[s_idx]
+            voice = m.voices[i] if i < len(m.voices) else None
+            last = clusters[-1] if clusters else None
+            if (
+                last is not None
+                and cx - last.start <= TOLERANCE
+                and (voice is None or (s_idx, voice) not in last.voices)
+            ):
+                cluster = last
             else:
-                clusters.append(sum(current_cluster) / len(current_cluster))
-                current_cluster = [cx]
-        if current_cluster:
-            clusters.append(sum(current_cluster) / len(current_cluster))
+                cluster = _Slice(cx)
+                clusters.append(cluster)
+            cluster.cxs.append(cx)
+            cluster.members.append((s_idx, i))
+            if voice is not None:
+                cluster.voices.add((s_idx, voice))
 
-        merged_timeline = sorted(clusters)
-        slices = [[[] for _ in measures] for _ in merged_timeline]
-        for s_idx, m in enumerate(measures):
-            for token, cx in zip(m.tokens, m.cxs, strict=False):
-                t_idx = min(range(len(merged_timeline)), key=lambda j: abs(merged_timeline[j] - cx))
-                slices[t_idx][s_idx].append(token)
-        return slices, merged_timeline
+        slices = []
+        for cluster in clusters:
+            row: list[list[str]] = [[] for _ in measures]
+            for s_idx, i in sorted(cluster.members, key=lambda member: member[1]):
+                row[s_idx].append(measures[s_idx].tokens[i])
+            slices.append(row)
+        return slices, [sum(c.cxs) / len(c.cxs) for c in clusters]
 
     def _synchronize_measures(self):
         """Align measures across spines, preferring sync edges over geometry."""
@@ -1093,7 +1138,7 @@ class MinimalHumdrumSerializer:
 
             # 3b. Collect events and analyze each one; mid-measure clef
             # changes re-clef every event drawn to their right
-            events, tuplet_ratios, beam_of, clef_marks = self._collect_staff_events(
+            events, tuplet_of, beam_of, clef_marks, layer_of = self._collect_staff_events(
                 staff_id, children, nodes
             )
             event_infos = [
@@ -1124,6 +1169,7 @@ class MinimalHumdrumSerializer:
 
             # 4. Scale tuplet durations: a triplet eighth is a kern '12'
             # (the scaled number is both the display token and the true value)
+            tuplet_ratios = self._tuplet_ratios(events, event_infos, tuplet_of)
             for info, ev in zip(event_infos, events, strict=False):
                 ratio = tuplet_ratios.get(ev.get("id"))
                 if ratio and not info.get("grace"):
@@ -1158,11 +1204,12 @@ class MinimalHumdrumSerializer:
             )
 
             # 7. Serialize to kern tokens with durations, spatial cx and node ID
-            for info in event_infos:
+            for info, ev in zip(event_infos, events, strict=True):
                 # Grace notes take no time on the timeline
                 dur = 0.0 if info.get("grace") else _note_value(info["duration"], info["dots"])
                 cx = info.get("cx", 0.0)
-                measure.add(self._info_to_kern(info), dur, cx, info.get("id"))
+                voice = layer_of.get(ev.get("id"))
+                measure.add(self._info_to_kern(info), dur, cx, info.get("id"), voice)
 
             spine.add_measure(measure)
 
@@ -1415,11 +1462,12 @@ class MinimalHumdrumSerializer:
     def _collect_staff_events(self, staff_id: str, children: dict, nodes: dict) -> tuple:
         """Find temporal-anchor events under a staff, ordered by Class 3 (Temporal) edges.
 
-        Returns (sorted_events, tuplet_ratios, beam_of, clef_marks) where
-        tuplet_ratios maps event IDs to a (num, numbase) duration ratio for
-        events inside tuplets, beam_of maps event IDs to their containing
-        beam node ID, and clef_marks is a cx-sorted list of (cx, clef_type)
-        mid-measure clef changes found under this staff.
+        Returns (sorted_events, tuplet_of, beam_of, clef_marks, layer_of)
+        where tuplet_of maps the IDs of events inside tuplets to their tuplet
+        node ID, beam_of maps event IDs to their containing
+        beam node ID, clef_marks is a cx-sorted list of (cx, clef_type)
+        mid-measure clef changes found under this staff, and layer_of maps
+        event IDs to their layer node ID.
         """
         # 1. Collect all structural descendants via Class 1 edges. Tuplets are
         # modifier-class containers (Class 2 edge from the layer) but hold
@@ -1430,10 +1478,11 @@ class MinimalHumdrumSerializer:
         descendants: dict = {}  # ordered set
         tuplet_of = {}
         beam_of = {}
+        layer_of = {}
         clef_marks = []
-        stack = [(staff_id, None, None)]
+        stack = [(staff_id, None, None, None)]
         while stack:
-            curr, tuplet_ctx, beam_ctx = stack.pop()
+            curr, tuplet_ctx, beam_ctx, layer_ctx = stack.pop()
             for child_id, e_class in children.get(curr, []):
                 if child_id in descendants:
                     continue
@@ -1458,11 +1507,14 @@ class MinimalHumdrumSerializer:
                         )
                     ctx = child_id if is_tuplet_container else tuplet_ctx
                     b_ctx = child_id if child_cls.startswith("beam") else beam_ctx
+                    l_ctx = child_id if child_cls == "layer" else layer_ctx
                     if ctx is not None:
                         tuplet_of[child_id] = ctx
                     if b_ctx is not None and b_ctx != child_id:
                         beam_of[child_id] = b_ctx
-                    stack.append((child_id, ctx, b_ctx))
+                    if l_ctx is not None and l_ctx != child_id:
+                        layer_of[child_id] = l_ctx
+                    stack.append((child_id, ctx, b_ctx, l_ctx))
         clef_marks.sort()
 
         # 2. Filter down to valid top-level event temporal anchors
@@ -1521,26 +1573,58 @@ class MinimalHumdrumSerializer:
             )
             sorted_events.extend(missing_nodes)
 
-        # 6. Derive tuplet duration ratios: a tuplet of N events plays N in the
-        # time of the largest power of two below N (3:2, 5:4, 6:4, 7:4...)
-        events_per_tuplet = {}
-        for ev_id in top_level_events:
-            t_id = tuplet_of.get(ev_id)
-            if t_id is not None:
-                events_per_tuplet.setdefault(t_id, []).append(ev_id)
+        # 6. Tuplet membership of the events; the ratio needs their durations
+        # (see _tuplet_ratios)
+        events_in_tuplets = {e: t for e in top_level_events if (t := tuplet_of.get(e)) is not None}
 
-        tuplet_ratios = {}
-        for ev_ids in events_per_tuplet.values():
-            num = len(ev_ids)
-            if num < 3:
+        return sorted_events, events_in_tuplets, beam_of, clef_marks, layer_of
+
+    @staticmethod
+    def _tuplet_ratios(events: list, event_infos: list, tuplet_of: dict) -> dict:
+        """(num, numbase) per event inside a tuplet.
+
+        The printed number is not in the graph (tupletNum is a class, not a
+        value), so it is inferred. A tuplet's written durations add up to num
+        units of some note value: an eighth, two sixteenths and an eighth make
+        3/8, a triplet. Counting events instead (N events in the time of the
+        largest power of two below N) misreads every tuplet that mixes values:
+        4:2 for that one, nothing for a quarter-eighth triplet. The count is
+        kept as a cross-check: when the two disagree the triplet reading wins,
+        so one misread notehead (5/16 from three eighths) stays a triplet, and
+        totals no tuplet has (11/16) are read as triplets too.
+        """
+        groups: dict = {}
+        for ev, info in zip(events, event_infos, strict=False):
+            t_id = tuplet_of.get(ev.get("id"))
+            if t_id is not None and not info.get("grace"):
+                groups.setdefault(t_id, []).append((ev.get("id"), info))
+
+        def power_below(n: int) -> int:
+            p = 1
+            while p * 2 < n:
+                p *= 2
+            return p
+
+        ratios = {}
+        for members in groups.values():
+            written = sum(
+                (
+                    Fraction(1, info["duration"]) * (2 - Fraction(1, 2 ** info.get("dots", 0)))
+                    for _, info in members
+                    if info.get("duration")
+                ),
+                Fraction(0),
+            )
+            # a tuplet of a power of two (4 in the time of 2) is never written
+            candidates = [n for n in (written.numerator, len(members)) if n >= 3 and n & (n - 1)]
+            if not candidates:
                 continue
-            numbase = 1
-            while numbase * 2 < num:
-                numbase *= 2
-            for ev_id in ev_ids:
-                tuplet_ratios[ev_id] = (num, numbase)
-
-        return sorted_events, tuplet_ratios, beam_of, clef_marks
+            num = next((n for n in candidates if n in (3, 6, 12)), None) or next(
+                (n for n in candidates if n in (5, 7, 9)), 3
+            )
+            for ev_id, _ in members:
+                ratios[ev_id] = (num, power_below(num))
+        return ratios
 
     # --- Event analysis (returns structured dicts) ---
 

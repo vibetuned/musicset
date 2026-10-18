@@ -154,3 +154,16 @@ def test_cli_augment_copies_pages_and_graphs(sources: Path, tmp_path: Path):
         assert (aug / "imgs" / f"tiny__aug{k}_page1.png").exists()
         graph = json.loads((aug / "graphs" / f"tiny__aug{k}.json").read_text())
         assert graph["json_files"] == [f"tiny__aug{k}_page1.json"]
+
+
+def test_pages_with_staves_off_the_page_are_rejected(tiny_page):
+    import copy
+
+    from musicset.pipeline import _overflow
+
+    assert _overflow(tiny_page) is None
+    page = copy.deepcopy(tiny_page)
+    staff = next(e for e in page.elements if e.classes[:1] == ("staff",))
+    assert staff.bbox is not None
+    staff.bbox = (staff.bbox[0], staff.bbox[1], staff.bbox[2], page.height + 50)
+    assert "runs off the page" in (_overflow(page) or "")
