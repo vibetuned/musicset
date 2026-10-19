@@ -229,3 +229,42 @@ def test_arranged_triplets_are_proper_tuplets():
     assert [p.nameWithOctave for n in m.notes for p in n.pitches] == ["C6", "D6", "E6"]
     (ottava,) = m.getElementsByClass(music21.spanner.Ottava)
     assert ottava.type == "8va" and not ottava.transposing
+
+
+def _eight_measures() -> music21.stream.Score:
+    part = music21.stream.Part()
+    for i in range(1, 9):
+        m = music21.stream.Measure(number=i)
+        if i == 1:
+            m.insert(0, music21.key.Key("D"))
+            m.insert(0, music21.meter.TimeSignature("4/4"))
+        for p in ("D5", "E5", "F#5", "G5"):
+            m.append(music21.note.Note(p, quarterLength=1.0))
+        part.append(m)
+    return music21.stream.Score([part])
+
+
+def test_key_changes_cancel_the_old_signature():
+    from musicset.synth.decorate import add_key_changes
+
+    for seed in range(5):
+        score = _eight_measures()
+        add_key_changes(score, 1.0, random.Random(seed))
+        keys = list(score.recurse().getElementsByClass(music21.key.KeySignature))
+        assert len(keys) >= 2
+        assert (keys[1].sharps or 0) < 2  # fewer sharps (or flats): naturals to draw
+
+
+def test_measure_rests_keep_the_ends_and_tied_notes():
+    from musicset.synth.decorate import add_measure_rests
+
+    score = _eight_measures()
+    notes = list(score.recurse().notes)
+    notes[8].tie, notes[9].tie = music21.tie.Tie("start"), music21.tie.Tie("stop")  # measure 3
+    add_measure_rests(score, 1.0, random.Random(0))
+    measures = list(score.parts[0].getElementsByClass(music21.stream.Measure))
+    rested = [i for i, m in enumerate(measures) if not list(m.notes)]
+    assert rested == [1, 3, 4, 5, 6]  # not the first, last, or the one with a tie
+    rest = next(iter(measures[1].notesAndRests))
+    assert isinstance(rest, music21.note.Rest)
+    assert rest.fullMeasure is True and rest.quarterLength == 4

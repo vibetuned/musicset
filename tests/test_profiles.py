@@ -25,7 +25,7 @@ def test_sampled_options_stay_inside_verovio_limits():
             spec = limits[key]
             if "min" in spec and not isinstance(value, bool):
                 assert spec["min"] <= value <= spec["max"], (key, value)
-        assert opts.breaks in ("auto", "encoded")
+        assert opts.breaks in ("auto", "line")
 
 
 def test_sampling_is_seeded_and_breaks_need_a_source_that_has_them():

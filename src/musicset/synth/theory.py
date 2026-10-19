@@ -36,12 +36,17 @@ ALL_METERS = (
 DETECTOR_METERS = (
     "1/4", "1/4", "2/4", "2/2", "3/4", "3/8", "6/8", "6/4", "12/8", "12/8", "16/12",
     "8/8", "16/8", "C", "C", "cut", "cut", "4/4", "9/8", "16/16",
+    # rarer digits: 9 (9/8, 9/4), 5, 7 and 0 (10/8)
+    "9/8", "9/4", "5/4", "5/8", "7/8", "7/4", "10/8",
 )  # fmt: skip
 METER_SETS = {
     "simple": SIMPLE_METERS,
     "medium": MEDIUM_METERS,
     "full": ALL_METERS,
     "detector": DETECTOR_METERS,
+    # meters whose signatures a detector rarely sees: short pieces in them
+    # multiply the signatures, which are drawn once per piece
+    "rare": ("9/8", "9/4", "5/4", "5/8", "7/8", "7/4", "10/8", "C", "cut", "12/8", "3/8", "6/4"),
 }
 
 

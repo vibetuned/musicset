@@ -460,7 +460,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--start", type=int, default=0, help="first index (to extend a batch)")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--profile", default="default", help="notation rates: plain, default, detector")
+    p.add_argument(
+        "--profile", default="default", help="notation rates: plain, default, detector, rare"
+    )
     p.add_argument("--pool", type=Path, help="counterpoint pool (.jsonl)")
     p.add_argument("--sources", type=Path, help="real scores to mutate or arrange")
     g = p.add_argument_group("exercise")
@@ -470,7 +472,7 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--no-dynamics", action="store_true")
     g.add_argument("--no-slurs", action="store_true")
     g.add_argument("--no-ties", action="store_true")
-    g.add_argument("--meters", choices=("simple", "medium", "full", "detector"))
+    g.add_argument("--meters", choices=("simple", "medium", "full", "detector", "rare"))
     g.add_argument(
         "--contents",
         nargs="+",

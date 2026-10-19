@@ -25,6 +25,7 @@ ORNAMENTS = {
     "trill": music21.expressions.Trill,
     "mordent": music21.expressions.Mordent,
     "turn": music21.expressions.Turn,
+    "fermata": music21.expressions.Fermata,
 }
 ARTICULATIONS = (
     music21.articulations.Staccato,
@@ -72,6 +73,11 @@ class Profile:
     """Share of octave clefs that are 8va."""
     ottava: float = 0.0
     """Per part: an 8va/8vb bracket over a few notes."""
+    key_change: float = 0.0
+    """Per score: a key change partway (cancellation naturals), half the time
+    back to the opening key later."""
+    measure_rest: float = 0.0
+    """Per measure of each part (not the first or last): a whole-measure rest."""
 
     def with_(self, **changes) -> Profile:
         return replace(self, **changes)
@@ -96,7 +102,7 @@ PROFILES: dict[str, Profile] = {
         meters=DETECTOR_METERS,
         durations=(4.0, 2.0, 1.0, 0.5, 0.25, 0.125),
         duration_weights=(0.08, 0.14, 0.33, 0.24, 0.14, 0.07),
-        ornaments=("trill", "trill", "mordent", "turn"),
+        ornaments=("trill", "trill", "mordent", "mordent", "turn", "fermata"),
         dynamics=("pp", "pp", "mp", "mp", "ff", "ff", "p", "z", "sfz", "fz", "mf", "f"),
         fingered=1.0,
         fingering=1.0,
@@ -104,8 +110,13 @@ PROFILES: dict[str, Profile] = {
         clef_change=0.25,
         octave_clef=0.40,
         ottava=0.30,
+        key_change=0.35,
+        measure_rest=0.04,
     ),
 }
+# The detector profile's rare-class weighting without its fingering flood
+# (a digit on every note: 41k boxes in 120 scores, a class nothing reads)
+PROFILES["rare"] = PROFILES["detector"].with_(name="rare", fingered=0.2, fingering=0.5)
 
 
 def profile(name: str | Profile) -> Profile:
@@ -319,6 +330,61 @@ def add_ottavas(score: music21.stream.Score, rate: float, rng: random.Random) ->
         part.insert(0, ottava)
 
 
+def _key_of(score: music21.stream.Score) -> music21.key.KeySignature | None:
+    return score.recurse().getElementsByClass(music21.key.KeySignature).first()
+
+
+def add_key_changes(score: music21.stream.Score, rate: float, rng: random.Random) -> None:
+    """A key change at a measure in every part, drawn as the new signature
+    after naturals cancelling the old one; half the time back home later."""
+    parts = _parts(score)
+    if not parts or rng.random() >= rate:
+        return
+    measures = [_measures(part) for part in parts]
+    count = min(len(ms) for ms in measures)
+    current = _key_of(score)
+    if count < 6 or current is None:
+        return
+    # a different key with accidentals the old one had to cancel: two or
+    # more fewer sharps or flats, or the other side of the circle
+    sharps = current.sharps or 0
+    choices = [k for k in range(-6, 7) if k != sharps and (abs(k) < abs(sharps) or k * sharps < 0)]
+    if not choices:
+        choices = [k for k in range(-6, 7) if k != sharps]
+    new = rng.choice(choices)
+    at = rng.randint(2, count - 3)
+    back = rng.randint(at + 1, count - 1) if rng.random() < 0.5 and at + 1 < count - 1 else None
+    for ms in measures:
+        ms[at].insert(0.0, music21.key.KeySignature(new))
+        if back is not None:
+            ms[back].insert(0.0, music21.key.KeySignature(sharps))
+
+
+def add_measure_rests(score: music21.stream.Score, rate: float, rng: random.Random) -> None:
+    """Empty some measures (not the first or last) into whole-measure rests;
+    measures holding a tied or spanned note keep their notes."""
+    if not rate:
+        return
+    for part in _parts(score):
+        measures = _measures(part)
+        for m in measures[1:-1]:
+            if rng.random() >= rate:
+                continue
+            events = list(m.recurse().notesAndRests)
+            if not events or any(
+                getattr(e, "tie", None) is not None or e.getSpannerSites() for e in events
+            ):
+                continue
+            bar = m.barDuration.quarterLength
+            for e in events:
+                e.activeSite.remove(e)
+            for v in list(m.voices):
+                m.remove(v)
+            rest = music21.note.Rest(quarterLength=bar)
+            rest.fullMeasure = True
+            m.insert(0.0, rest)
+
+
 def decorate(
     score: music21.stream.Score,
     p: Profile,
@@ -334,6 +400,7 @@ def decorate(
     or off (default: the profile's share of fingered scores).
     """
     fingered = rng.random() < p.fingered if fingerings is None else fingerings
+    add_measure_rests(score, p.measure_rest, rng)  # before ties and spanners
     for part in _parts(score):
         if notes:
             for n in part.recurse().notes:
@@ -351,4 +418,5 @@ def decorate(
     add_clef_changes(score, p.clef_change, rng)
     add_octave_clefs(score, p.octave_clef, p.octave_8va, rng)
     add_ottavas(score, p.ottava, rng)
+    add_key_changes(score, p.key_change, rng)
     return score

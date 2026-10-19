@@ -34,7 +34,8 @@ class RenderOptions:
     page_height: int = 2970
     scale: int = 100
     breaks: str = "auto"
-    """``auto`` (Verovio lays out), ``encoded`` (keep the source's line/page breaks), ``none``..."""
+    """``auto`` (Verovio lays out), ``line`` (the source's system breaks, Verovio's
+    page breaks), ``encoded`` (the source's system and page breaks), ``none``..."""
     header: str = "auto"
     footer: str = "auto"
     xml_id_seed: int = 42

@@ -167,3 +167,26 @@ def test_pages_with_staves_off_the_page_are_rejected(tiny_page):
     assert staff.bbox is not None
     staff.bbox = (staff.bbox[0], staff.bbox[1], staff.bbox[2], page.height + 50)
     assert "runs off the page" in (_overflow(page) or "")
+
+
+def test_varied_scores_rebuild_when_their_sampled_options_change(tmp_path: Path):
+    """The global fingerprint cannot see a sampler change; each score's options can."""
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy(FIXTURES / "tiny.musicxml", src / "tiny.musicxml")
+    layout = Layout(tmp_path / "out")
+    layout.create()
+    cfg = BuildConfig(profile="varied", write_svg=False)
+    task = (src / "tiny.musicxml", layout, cfg, 0)
+    assert build_score(task).status == "built"
+    assert build_score(task).status == "skipped"
+
+    path = layout.manifest / "tiny.json"
+    manifest = json.loads(path.read_text())
+    del manifest["options_fingerprint"]  # older manifests: compared via render_options
+    path.write_text(json.dumps(manifest))
+    assert build_score(task).status == "skipped"
+
+    manifest["render_options"]["font"] = "not-what-the-sampler-picks"
+    path.write_text(json.dumps(manifest))
+    assert build_score(task).status == "built"

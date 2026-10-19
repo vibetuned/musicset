@@ -40,11 +40,18 @@ def sample_render_options(
     rng: random.Random, base: RenderOptions | None = None, *, encoded_breaks: bool = False
 ) -> RenderOptions:
     """Engraving options for one score. ``encoded_breaks``: the source has line
-    breaks to keep (half the time); without any, ``encoded`` would put a whole
-    piece on one system."""
+    breaks to keep (half the time); without any, they would put a whole piece
+    on one system.
+
+    The source's systems are kept with Verovio's ``line`` (encoded system
+    breaks, its own page breaks), never ``encoded``: encoded page breaks were
+    set for the source's page size and staff scale, and on a sampled page a
+    page's worth of systems overflowed it by up to 15% (58 of 10,000 lite
+    scores, all rejected).
+    """
     base = base or RenderOptions()
     width, height = _pick(rng, PAGES)
-    breaks = "encoded" if encoded_breaks and rng.random() < 0.5 else "auto"
+    breaks = "line" if encoded_breaks and rng.random() < 0.5 else "auto"
     extra = {
         "staffLineWidth": _heavy(rng, 0.10, 0.30),
         "stemWidth": _heavy(rng, 0.15, 0.50),

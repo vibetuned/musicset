@@ -321,10 +321,21 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
     manifest_path = layout.manifest / f"{score}.json"
     render_fp = cfg.render_fingerprint()
     labels_fp = cfg.labels_fingerprint()
+    musicxml = read_musicxml(source)
+    # A varied profile samples options per score: the global fingerprint
+    # cannot see a sampler change, so each score's own options are compared too
+    options = cfg.options_for(score, musicxml.text)
+    options_fp = options.fingerprint()
 
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("render_fingerprint") == render_fp:
+        recorded = manifest.get("options_fingerprint")
+        if recorded is None:  # manifests written before the field: their stored options
+            try:
+                recorded = RenderOptions(**manifest.get("render_options", {})).fingerprint()
+            except TypeError:
+                recorded = None
+        if manifest.get("render_fingerprint") == render_fp and recorded == options_fp:
             if cfg.labels is None or manifest.get("labels_fingerprint") == labels_fp:
                 return ScoreReport(score, "skipped", len(manifest["pages"]))
             infos = manifest["pages"]
@@ -345,11 +356,8 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
         manifest_path.unlink()
 
     _remove_pages(layout, score)
-    musicxml = read_musicxml(source)
     musicxml.text = inject_ids(musicxml.text, id_prefix(score))
     write_mxl(layout.injected / f"{score}.mxl", musicxml)
-
-    options = cfg.options_for(score, musicxml.text)
     engraving = Engraving.load(musicxml.text, options)
     if cfg.max_pages and engraving.page_count > cfg.max_pages:
         (layout.injected / f"{score}.mxl").unlink()
@@ -413,6 +421,7 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
         "render_options": asdict(options),
         "raster_scale": cfg.raster_scale,
         "render_fingerprint": render_fp,
+        "options_fingerprint": options_fp,
         "labels": cfg.labels.name if cfg.labels else None,
         "labels_fingerprint": labels_fp,
         **views,

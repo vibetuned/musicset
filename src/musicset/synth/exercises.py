@@ -24,6 +24,8 @@ from musicset.synth.decorate import (
     Profile,
     add_clef_changes,
     add_double_barlines,
+    add_key_changes,
+    add_measure_rests,
     add_octave_clefs,
     add_ottavas,
     add_slurs,
@@ -312,4 +314,6 @@ def generate(rng: random.Random, cfg: ExerciseConfig | None = None) -> music21.s
     add_clef_changes(score, p.clef_change, rng)
     add_octave_clefs(score, p.octave_clef, p.octave_8va, rng)
     add_ottavas(score, p.ottava, rng)
+    add_measure_rests(score, p.measure_rest, rng)
+    add_key_changes(score, p.key_change, rng)
     return score

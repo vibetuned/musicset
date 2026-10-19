@@ -186,7 +186,9 @@ renders draw 0.056, and Verovio's heaviest setting reaches only 0.15.
   score and variant, a font (Leipzig, Bravura, Gootville, Leland, Petaluma),
   staff size, line/stem/barline/ledger weights leaning heavy, slur and hairpin
   thickness, spacing, page size and margins, header/footer, and MuseScore's
-  encoded breaks half of the time when the source has them. Seeded, inside
+  encoded system breaks half of the time when the source has them (Verovio
+  `line`: its own page breaks, since encoded page breaks overflow a sampled
+  page). Seeded, inside
   Verovio's published option limits, recorded in each manifest.
 - **Augmentation** (`musicset.augment`): degradation steps modelled on how a
   scan is made (ink spread, faded ink, show-through, paper, skew, perspective,
@@ -232,48 +234,30 @@ uv run musicset synth mutate data/synth/src --sources data/piano/sources
 uv run musicset build data/synth/src data/synth --labels lite --kern --profile varied
 ```
 
-| Kind | What | From |
-|---|---|---|
-| `exercise` | scales (major, harmonic/melodic minor, chromatic) and chord progressions, one or two staves, with curriculum switches (`--staves`, `--no-fingerings`, `--no-ornaments`, `--no-dynamics`, `--no-slurs`, `--no-ties`, `--meters`, `--contents`) | kakigori + gelato synthetic writer (merged) |
-| `piano` | a melody, chords or thirds over block chords, Alberti bass, broken chords, oom-pah, octaves or arpeggios, on a functional progression (cadences, secondary dominants, sevenths, sus4, pivot modulations) voiced with minimal motion | chirality's chord and arpeggio generators |
-| `counterpoint` | two-voice species counterpoint (1st-5th species) from the pool, in any key, in 4/4, C, cut time or halved into 2/4, as a piano grand staff, an instrumental duet (alto and tenor clefs), two voices on one staff, or a choir with Latin lyrics | chirality's Herremans & Sörensen VNS (`musicset.synth.counterpoint`, ported verbatim and checked note for note) |
-| `easy`, `melody` | one-measure and 4-8 measure single-staff scores for first curriculum stages | gelato easy / intermediate writers |
-| `mutate`, `arrange` | real scores with rare notation injected (32nds, triplets, ornaments, ottavas, octave clefs, clef changes, double barlines...), or one mutation per measure | kakigori synthetic generator / arranger |
+| Kind | What |
+|---|---|
+| `exercise` | scales (major, harmonic/melodic minor, chromatic) and chord progressions, one or two staves, with curriculum switches (`--staves`, `--no-fingerings`, `--no-ornaments`, `--no-dynamics`, `--no-slurs`, `--no-ties`, `--meters`, `--contents`) |
+| `piano` | a melody, chords or thirds over block chords, Alberti bass, broken chords, oom-pah, octaves or arpeggios, on a functional progression (cadences, secondary dominants, sevenths, sus4, pivot modulations) voiced with minimal motion |
+| `counterpoint` | two-voice species counterpoint (1st-5th species, Herremans & Sörensen's VNS in `musicset.synth.counterpoint`) from the pool, in any key, in 4/4, C, cut time or halved into 2/4, as a piano grand staff, an instrumental duet (alto and tenor clefs), two voices on one staff, or a choir with Latin lyrics |
+| `easy`, `melody` | one-measure and 4-8 measure single-staff scores for first curriculum stages |
+| `mutate`, `arrange` | real scores with rare notation injected (32nds, triplets, ornaments, ottavas, octave clefs, clef changes, double barlines...), or one mutation per measure |
 
 Notation rates are a `Profile` (`musicset.synth.decorate`): `plain` (notes
-only), `default` (gelato's rates) or `detector` (kakigori's: weighted toward the
-classes its detector reads worst: 32nds, trills, pp/mp/ff, double barlines,
-common/cut time, clef changes, octave clefs, ottava brackets). On a sample
-build every one of the 87 `lite` classes appears; C clefs come from the
+only), `default` (moderate rates), `detector` (weighted toward the classes a
+detector reads worst: 32nds, trills, mordents, fermatas, pp/mp/ff, double
+barlines, common/cut and 5/7/9/10 meters, clef changes, octave clefs, ottava
+brackets, key changes drawing cancellation naturals, whole-measure rests,
+fingering on every note) or `rare` (the same without the fingering flood).
+`--meters rare` with short pieces (`--min-measures 4 --max-measures 8`)
+multiplies the rare time signatures, which a piece draws only once. On a
+sample build every one of the 87 `lite` classes appears; C clefs come from the
 counterpoint duets, double sharps from the leading tones of sharp minor keys.
-
-Fixed on the way from the old writers:
-
-- **Spelling**: chords are built from their root by interval names (E-flat
-  minor is E-flat, G-flat, B-flat), octave moves keep the spelling (music21's
-  `transpose(12)` respells G-flat as F-sharp), leading-tone chords are F-sharp
-  diminished in G, not G-flat; counterpoint pitches built from MIDI numbers are
-  pinned before transposition (music21 re-simplifies "inferred" spellings).
-- **Shared pitches**: `Note(pitch)` does not copy; scale runs reused pitch
-  objects, and music21 transposing the notes under an 8va moved every note that
-  shared them (E5 written as E7).
-- **Register**: scale runs stay within A6 / E1 written; a shifted B major run
-  climbed to B7, seven ledger lines up.
-- **Octave clefs** open the part instead of arriving mid-system, where the
-  change glyph is labelled gClefChange (plain treble) and the measures up to
-  the next system read an octave off.
-- **Grand staff**: two-staff exercises are one braced piano part, not two
-  "Piano" parts; music21's "Music21 Fragment" title and "Music21" composer are
-  replaced by plausible titles (or none); repeated measures no longer restate
-  clef, key and meter.
 
 **kern on synthetic builds** (serializer vs MEI, pitch/rhythm): counterpoint,
 easy, melody 100/100; exercise 99.76/99.76; piano 99.59/99.57 (detector
 profile: octave clefs, clef changes, ottavas); arrange 99.37/98.99; mutate
-98.33/97.97.
-
-Mutated scores first scored 96.0/88.9; their crowded measures exposed faults
-that real scores hit rarely:
+98.33/97.97. Their crowded measures exposed faults real scores hit rarely,
+now fixed:
 
 - **Serializer**: closely set noteheads of one layer were sliced into one row
   (a kern chord); tuplet ratios came from the event count, so a triplet of an
@@ -286,17 +270,22 @@ that real scores hit rarely:
   sixteenth). The detection view now records each glyph's `parent` event from
   the SVG nesting and the graph view attaches by it (older datasets without
   it fall back to geometry).
-- **Generators**: kakigori's mutations hid the accidentals of the chords they
-  added (the page then shows a natural where the music has a flat), gave three
-  triplet notes one shared Tuplet (Verovio read three plain notes and three
-  one-note tuplets: a 5/4 measure), and moved ottava notes an octave besides
-  the bracket's own shift (8vb passages drawn seven ledger lines up).
 - **Build**: Verovio occasionally sets a last system taller than the room
-  left on the page; pages with a staff off the page are now rejected
-  (4 mutated scores) instead of yielding clipped groundtruth.
+  left on the page; pages with a staff off the page are rejected instead of
+  yielding clipped groundtruth.
 
 On the real sets the same fixes move validation-small rhythm 97.64 -> 97.71,
 validation-lite to 467/500 perfect files and varied examples to 34/44; nothing
 regresses. Detection and graph views carry `VIEWS_VERSION` in their
 fingerprint, so rebuilding an existing dataset re-projects them from `pages/`
 and `mei/` without rendering.
+
+**Known limitation: octave clefs changed mid-system.** A switch to an 8va/8vb
+treble clef inside a system is drawn as a small clef-change glyph, which the
+label sets can only call `gClefChange` (a plain treble clef). The kern
+serializer then reads every measure up to the next system an octave off (from
+the next system on, the full-size `clefG8va`/`clefG8vb` is read correctly).
+The generators therefore put octave clefs at the start of a part and only
+switch back to a plain treble clef mid-piece. Real scores rarely change to an
+octave clef mid-system; if they turn up, the fix is a `gClef8vaChange` /
+`gClef8vbChange` class pair (or reading the "8" off the glyph).
