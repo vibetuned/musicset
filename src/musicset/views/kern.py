@@ -995,6 +995,24 @@ class MinimalHumdrumSerializer:
         return sorted(rows.values(), key=lambda r: r.get("cy", 0.0))
 
     @staticmethod
+    def _reference_measure(measures: list, n_rows: int, children: dict, nodes: dict) -> str:
+        """The measure the spines are created from: the leftmost one with a
+        staff cell on every row of its system, else the one with the most.
+        On ground-truth graphs that is the first measure; on predicted graphs
+        the first can miss its measure->staff edges, and spines created from
+        it would be empty: the whole score would fail to serialize."""
+
+        def n_staves(measure_id):
+            return sum(
+                1
+                for v, e_class in children.get(measure_id, [])
+                if e_class == 1 and nodes.get(v, {}).get("class") == "staff"
+            )
+
+        complete = [m for m in measures if n_staves(m) == n_rows]
+        return complete[0] if complete else max(measures, key=n_staves)
+
+    @staticmethod
     def _system_measures(system: dict, children: dict, nodes: dict) -> list:
         measures = [
             v
@@ -2047,7 +2065,8 @@ class MinimalHumdrumSerializer:
                     continue
                 n_rows = len(self._system_rows(system, measures, children, nodes))
                 if n_rows > best_rows:
-                    best_rows, ref = n_rows, (pi, system, measures[0])
+                    measure = self._reference_measure(measures, n_rows, children, nodes)
+                    best_rows, ref = n_rows, (pi, system, measure)
 
         if ref is None:
             return "Error: No valid systems found across any page."

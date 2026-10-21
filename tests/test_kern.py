@@ -110,3 +110,20 @@ def test_tuplet_ratio_from_written_total():
     assert ratio([16] * 5) == (5, 4)
     assert ratio([16] * 6) == (3, 2)  # sextuplet: same durations as 3:2
     assert ratio([8, 8]) is None  # nothing to read
+
+
+def test_reference_measure_has_the_system_staves():
+    """Spines come from a measure with a staff cell per row: on a predicted
+    graph the leftmost measure can miss its measure->staff edges."""
+    nodes = {f"s{i}": {"class": "staff"} for i in range(5)}
+    children = {
+        "m1": [],  # lost its edges
+        "m2": [("s0", 1), ("s1", 1)],
+        "m3": [("s2", 1), ("s3", 1), ("s4", 1)],  # a wrong edge into another system
+        "m4": [("s0", 1), ("note", 2)],
+    }
+    ref = MinimalHumdrumSerializer._reference_measure
+    assert ref(["m1", "m2", "m3"], 2, children, nodes) == "m2"
+    assert ref(["m1", "m4"], 2, children, nodes) == "m4"  # none complete: the most staves
+    children["m1"] = [("s0", 1), ("s1", 1)]
+    assert ref(["m1", "m2", "m3"], 2, children, nodes) == "m1"  # ground truth: the first
