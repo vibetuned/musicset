@@ -242,7 +242,7 @@ def cmd_view(args: argparse.Namespace) -> None:
         scans = sorted(
             p for p in args.scans.iterdir() if p.suffix.lower() in (".pdf", ".png", ".jpg")
         )
-    run(args.dataset, _labels(args), scans)
+    run(args.dataset, _labels(args), scans, args.pred_kern)
 
 
 def cmd_synth(args: argparse.Namespace) -> None:
@@ -504,6 +504,11 @@ def main(argv: list[str] | None = None) -> None:
     _add_labels_arg(p)
     p.add_argument(
         "--scans", type=Path, help="directory of reference scans (PDF/PNG) to compare with"
+    )
+    p.add_argument(
+        "--pred-kern",
+        type=Path,
+        help="directory of predicted **kern (<score>.krn) to compare in the Kern tab",
     )
     p.set_defaults(func=cmd_view)
 

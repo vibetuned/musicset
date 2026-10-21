@@ -28,11 +28,16 @@ class Dataset:
     """A dataset directory as built by ``musicset build``."""
 
     def __init__(
-        self, root: Path, labels: LabelSet | None, scans: list[Path] | None = None
+        self,
+        root: Path,
+        labels: LabelSet | None,
+        scans: list[Path] | None = None,
+        pred_kern: Path | None = None,
     ) -> None:
         self.root = root
         self.labels = labels
         self.scans = scans or []
+        self.pred_kern = pred_kern
         imgs = root / "imgs"
         self.stems: list[str] = sorted((p.stem for p in imgs.glob("*.png")), key=page_sort_key)
         self.by_score: dict[str, list[str]] = defaultdict(list)
@@ -84,6 +89,30 @@ class Dataset:
         if self.labels:
             return self.labels.classes
         return ClassMap(tuple(self.classes()), LabelSet.load("full").classes.smufl)
+
+    def kern(self, score: str) -> Path | None:
+        """The score's ground-truth **kern (``build --kern``)."""
+        path = self.root / "kern" / f"{score}.krn"
+        return path if path.exists() else None
+
+    def pred(self, score: str) -> Path | None:
+        """The score's predicted **kern from ``--pred-kern``."""
+        if self.pred_kern is None:
+            return None
+        path = self.pred_kern / f"{score}.krn"
+        return path if path.exists() else None
+
+    @cache  # noqa: B019
+    def kern_scores(self, score: str) -> dict[str, dict[str, Any] | None]:
+        """``musicset.evaluate.score_kern`` of the ground-truth and the
+        predicted kern against the score's MEI (None where one is missing)."""
+        from musicset.evaluate import score_kern
+
+        mei = self.root / "mei" / f"{score}.mei"
+        out: dict[str, dict[str, Any] | None] = {}
+        for which, path in (("gt", self.kern(score)), ("pred", self.pred(score))):
+            out[which] = score_kern(mei, path) if mei.exists() and path is not None else None
+        return out
 
     def source(self, score: str) -> Path | None:
         path = self.root / "injected" / f"{score}.mxl"

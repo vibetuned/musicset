@@ -184,6 +184,31 @@ def _find_staff_row(staff_node: dict, system_staves: list):
     return best
 
 
+def _nearest_row(y: float, rows: list):
+    """The row whose band holds y: the nearest 5-line box (0 inside one) —
+    between two rows the boundary is their midpoint."""
+    best, best_d = None, 0.0
+    for row in rows:
+        y1, y2 = row["bbox"][1], row["bbox"][3]
+        d = 0.0 if y1 <= y <= y2 else min(abs(y - y1), abs(y - y2))
+        if best is None or d < best_d:
+            best, best_d = row, d
+    return best
+
+
+def _on_staff(glyph: dict, staff_node: dict, rows: list) -> bool:
+    """Whether a signature glyph (clef, key or meter signature, key
+    accidental, clef change) is drawn on this staff cell's row. On a
+    predicted graph a cell can be linked to the other staff's glyphs (a grand
+    staff's bass clef read as a clef change of the treble staff); a glyph is
+    the staff's whose band holds it. Without rows, every glyph is accepted."""
+    own = _find_staff_row(staff_node, rows) if rows else None
+    if own is None:
+        return True
+    nearest = _nearest_row(glyph.get("cy", 0.0), rows)
+    return nearest is not None and nearest["bbox"] == own["bbox"]
+
+
 def _staff_sort_key(staff_node: dict, system_staves: list) -> float:
     """Stable top-to-bottom ordering key for staves within a measure."""
     row = _find_staff_row(staff_node, system_staves)
@@ -389,12 +414,14 @@ class Spine:
         """The leftmost node of a class sitting on a staff row: the signature
         in force at the system start, not a mid-system change."""
         sy1, sy2 = staff_node["bbox"][1], staff_node["bbox"][3]
+        rows = [n for n in nodes_map.values() if n.get("class") == "system-staff"]
         candidates = [
             node_id
             for node_id in system_descendants
             if (node := nodes_map.get(node_id))
             and node["class"].lower().startswith(kind)
             and sy1 - 20 <= node["cy"] <= sy2 + 20
+            and _on_staff(node, staff_node, rows)
         ]
         return min(candidates, key=lambda n: nodes_map[n]["cx"], default=None)
 
@@ -416,18 +443,24 @@ class Spine:
         # inside the keySig glyph's own horizontal span; and an accidental
         # linked both ways is only counted once.
         ks_bbox = nodes_map.get(keysig_id, {}).get("bbox")
+        staff_node = nodes_map.get(staff_id)
+        rows = [n for n in nodes_map.values() if n.get("class") == "system-staff"]
+
+        def on_staff(node):
+            return staff_node is None or _on_staff(node, staff_node, rows)
+
         valid_accids = []
         seen = set()
         for child_id, _ in children_map.get(keysig_id, []):
             child_node = nodes_map.get(child_id)
-            if child_node and "keyAccid" in child_node["class"]:
+            if child_node and "keyAccid" in child_node["class"] and on_staff(child_node):
                 seen.add(child_id)
                 valid_accids.append(child_node)
         for child_id, _ in children_map.get(staff_id, []):
             if child_id in seen:
                 continue
             child_node = nodes_map.get(child_id)
-            if not (child_node and "keyAccid" in child_node["class"]):
+            if not (child_node and "keyAccid" in child_node["class"] and on_staff(child_node)):
                 continue
             if ks_bbox:
                 pad = ks_bbox[3] - ks_bbox[1]
@@ -545,7 +578,9 @@ class Spine:
             clef_node: dict | None = None
             staff_elements = [v for v, e in children_map.get(st_id, []) if e == 1]
             for el_id in staff_elements:
-                if nodes_map[el_id]["class"].startswith("clef"):
+                if nodes_map[el_id]["class"].startswith("clef") and _on_staff(
+                    nodes_map[el_id], staff_node, system_staves
+                ):
                     clef_class, clef_node = nodes_map[el_id]["class"], nodes_map[el_id]
                     break
 
@@ -877,6 +912,8 @@ class MinimalHumdrumSerializer:
         self._pages = []
         # Per-page map: slur/tie node ID -> [(anchored event ID, cx), ...]
         self._span_anchors = {}
+        # Per-page map: event ID -> the measure emitting it (_measure_owners)
+        self._measure_owner: dict = {}
 
     @classmethod
     def from_pyg(cls, edge_index, edge_predictions, node_roles, pyg_node_ids):
@@ -1103,11 +1140,7 @@ class MinimalHumdrumSerializer:
         """Create a Measure for each staff, route it to the staff's PART
         (via the system's row→part assignment, not its top-to-bottom index),
         and pad parts hidden in this system with full-measure rests."""
-        staves = [
-            v
-            for v, e_class in children.get(measure_id, [])
-            if e_class == 1 and nodes.get(v, {}).get("class") == "staff"
-        ]
+        staves = self._measure_staves(measure_id, children, nodes)
         staves.sort(key=lambda s_id: _staff_sort_key(nodes[s_id], rows))
 
         # Each staff cell's system-staff row (tight 5-line bbox) and part.
@@ -1131,6 +1164,10 @@ class MinimalHumdrumSerializer:
         # them per staff row
         dynamics_per_staff = self._collect_dynamics(measure_id, children, nodes, staff_rows)
         pedals_per_staff = self._collect_pedals(measure_id, children, nodes, staff_rows)
+
+        staff_events = self._events_by_staff_band(
+            staves, staff_rows, children, nodes, measure_id=measure_id
+        )
 
         served = set()
         for spine_idx, staff_id in enumerate(staves):
@@ -1156,9 +1193,7 @@ class MinimalHumdrumSerializer:
 
             # 3b. Collect events and analyze each one; mid-measure clef
             # changes re-clef every event drawn to their right
-            events, tuplet_of, beam_of, clef_marks, layer_of = self._collect_staff_events(
-                staff_id, children, nodes
-            )
+            events, tuplet_of, beam_of, clef_marks, layer_of = staff_events[staff_id]
             event_infos = [
                 self._analyze_event(
                     ev,
@@ -1255,7 +1290,7 @@ class MinimalHumdrumSerializer:
             if e_class != 1:
                 continue
             node = nodes.get(child_id)
-            if not node:
+            if not node or (staff_id in nodes and not _on_staff(node, nodes[staff_id], staff_rows)):
                 continue
             cls_name = node["class"]
             cx = node.get("cx", 0.0)
@@ -1477,6 +1512,126 @@ class MinimalHumdrumSerializer:
 
     # --- Event collection ---
 
+    @staticmethod
+    def _measure_staves(measure_id: str, children: dict, nodes: dict) -> list:
+        """The staff cells of a measure (structural children of class staff)."""
+        return [
+            v
+            for v, e_class in children.get(measure_id, [])
+            if e_class == 1 and nodes.get(v, {}).get("class") == "staff"
+        ]
+
+    def _measure_owners(self, measures: list, children: dict, nodes: dict) -> dict:
+        """{event id: measure id} for the events reachable from staff cells
+        of several measures of a page.
+
+        On a predicted graph a beam, note or layer can hang off two adjacent
+        measures (a wrong edge across the barline), and each measure would
+        emit its subtree: on validation-lite detections the same note was
+        emitted in two measures 11.8k times, 18% of the output notes. Such an
+        event stays with the reaching measure whose box holds it — the
+        narrowest, if several do (a phantom measure spanning the system holds
+        everything) — or else the nearest one. Ground-truth graphs reach every
+        event from one measure.
+        """
+        reached: dict = {}
+        for measure_id in measures:
+            for staff_id in self._measure_staves(measure_id, children, nodes):
+                for event in self._collect_staff_events(staff_id, children, nodes)[0]:
+                    owners = reached.setdefault(event["id"], [])
+                    if measure_id not in owners:
+                        owners.append(measure_id)
+        owner = {}
+        for event_id, candidates in reached.items():
+            if len(candidates) < 2:
+                continue
+            event = nodes.get(event_id, {})
+            x, y = event.get("cx", 0.0), event.get("cy", 0.0)
+
+            def fit(measure_id: str, x: float = x, y: float = y) -> tuple:
+                x1, y1, x2, y2 = nodes[measure_id]["bbox"]
+                gap = max(x1 - x, 0.0, x - x2) + max(y1 - y, 0.0, y - y2)
+                return (gap, x2 - x1)
+
+            owner[event_id] = min(candidates, key=fit)
+        return owner
+
+    def _events_by_staff_band(
+        self, staves: list, staff_rows: list, children: dict, nodes: dict,
+        measure_id: str | None = None,
+    ) -> dict:
+        """Each staff cell's events, a multiply-reached event kept by one cell.
+
+        On a predicted graph an event can be reachable from several staff
+        cells of its measure (a wrong cross-staff edge, typically into the
+        other staff of a grand staff): each cell would emit it and read its
+        pitch against its own row, giving a duplicate about two octaves off.
+        It stays with the reaching cell whose band holds its noteheads —
+        bands split at the midpoint between adjacent rows — or, if none
+        does, the one whose row is nearest. Events are never moved to a cell
+        that did not reach them: a note one cell reaches stays with it, as
+        cross-staff notes are drawn on the other staff yet belong to their
+        layer's (validation-lite: moving out-of-band events cost 1.2-1.5
+        points of pitch recall and 2 of the median for ~1 of precision).
+
+        Events another measure owns (_measure_owners) are left to it.
+
+        Returns {staff_id: (events, tuplet_of, beam_of, clef_marks, layer_of)}
+        like _collect_staff_events.
+        """
+        collected = {
+            staff_id: self._collect_staff_events(staff_id, children, nodes) for staff_id in staves
+        }
+        if measure_id is not None and self._measure_owner:
+            owner_of = self._measure_owner
+            for staff_id, (events, *context) in collected.items():
+                kept = [e for e in events if owner_of.get(e["id"], measure_id) == measure_id]
+                collected[staff_id] = (kept, *context)
+        if len(staves) < 2:
+            return collected
+        # bands over the DISTINCT rows: two cells of one row (a duplicate cell
+        # on the predicted path) must not split that row between them
+        rows = sorted({tuple(r) for r in staff_rows}, key=lambda r: r[1] + r[3])
+        bounds = [(a[3] + b[1]) / 2.0 for a, b in itertools.pairwise(rows)]
+        reached: dict = {}
+        for idx, staff_id in enumerate(staves):
+            for event in collected[staff_id][0]:
+                reached.setdefault(event["id"], []).append(idx)
+        owner = {}
+        for event_id, cells in reached.items():
+            if len(cells) == 1:
+                continue
+            y = self._event_y(event_id, children, nodes)
+            band_row = rows[sum(y > b for b in bounds)]
+            in_band = [i for i in cells if tuple(staff_rows[i]) == band_row]
+            owner[event_id] = in_band[0] if in_band else min(
+                cells, key=lambda i: abs(y - (staff_rows[i][1] + staff_rows[i][3]) / 2.0)
+            )
+        result = {}
+        for idx, staff_id in enumerate(staves):
+            events, *context = collected[staff_id]
+            kept = [e for e in events if owner.get(e["id"], idx) == idx]
+            result[staff_id] = (kept, *context)
+        return result
+
+    @staticmethod
+    def _event_y(event_id: str, children: dict, nodes: dict) -> float:
+        """Where an event is drawn: the median of its noteheads' centres
+        (structural descendants), or its own centre (rests)."""
+        heads, seen, stack = [], set(), [event_id]
+        while stack:
+            for child_id, e_class in children.get(stack.pop(), []):
+                if e_class != 1 or child_id in seen:
+                    continue
+                seen.add(child_id)
+                stack.append(child_id)
+                if nodes.get(child_id, {}).get("class") in NOTEHEAD_BASE_DURATION:
+                    heads.append(nodes[child_id].get("cy", 0.0))
+        if heads:
+            heads.sort()
+            return heads[len(heads) // 2]
+        return nodes.get(event_id, {}).get("cy", 0.0)
+
     def _collect_staff_events(self, staff_id: str, children: dict, nodes: dict) -> tuple:
         """Find temporal-anchor events under a staff, ordered by Class 3 (Temporal) edges.
 
@@ -1498,6 +1653,7 @@ class MinimalHumdrumSerializer:
         beam_of = {}
         layer_of = {}
         clef_marks = []
+        system_rows = [n for n in nodes.values() if n.get("class") == "system-staff"]
         stack = [(staff_id, None, None, None)]
         while stack:
             curr, tuplet_ctx, beam_ctx, layer_ctx = stack.pop()
@@ -1508,8 +1664,11 @@ class MinimalHumdrumSerializer:
                 is_tuplet_container = e_class == 2 and child_cls == "tuplet"
                 if e_class == 1 or is_tuplet_container:
                     descendants[child_id] = None
-                    if child_cls in CLEF_CHANGE_MAP:
-                        rows = [n for n in nodes.values() if n.get("class") == "system-staff"]
+                    if child_cls in CLEF_CHANGE_MAP and (
+                        staff_id not in nodes
+                        or _on_staff(nodes[child_id], nodes[staff_id], system_rows)
+                    ):
+                        rows = system_rows
                         row = _find_staff_row(nodes[staff_id], rows) if staff_id in nodes else None
                         clef_marks.append(
                             (
@@ -2084,6 +2243,11 @@ class MinimalHumdrumSerializer:
         # Pass 2: serialize in document order
         for page_nodes, nodes, children, systems in page_data:
             self._prepare_page_state(page_nodes, nodes, children)
+            self._measure_owner = self._measure_owners(
+                [m for system in systems for m in self._system_measures(system, children, nodes)],
+                children,
+                nodes,
+            )
             for system in systems:
                 measures = self._system_measures(system, children, nodes)
                 if not measures:

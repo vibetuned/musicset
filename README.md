@@ -49,6 +49,7 @@ uv run musicset augment data/piano data/piano-scans --preset mixed --copies 2
 
 # 4. Look at it, next to real scans
 uv run musicset view data/piano --labels lite --scans examples/imslp
+uv run musicset view data/validation-lite --labels lite --pred-kern ../kakigori/inference_out/validation_det/krn
 ```
 
 `scripts/make_examples.py` fills the gitignored `examples/` with 22 varied
@@ -66,7 +67,7 @@ transposing ensembles) to try every command on in seconds.
 | `augment` | scan-like copies of a built dataset: images, moved boxes, graph copies |
 | `synth` | synthetic MusicXML: `exercise`, `piano`, `counterpoint`, `easy`, `melody`, `mutate`, `arrange` (see below) |
 | `counterpoint-pool` | compose species counterpoint for `synth counterpoint` (slow; resumable JSON lines) |
-| `view` | Qt viewer: page with boxes, graph edges and text target; the score graph as a network (ForceAtlas2, spring or page-position layout, nodes drawn as their SMuFL glyph or page crop, class/id labels, hover highlights neighbours, drag moves nodes); augmentation next to real scans |
+| `view` | Qt viewer: page with boxes, graph edges and text target; the score graph as a network (ForceAtlas2, spring or page-position layout, nodes drawn as their SMuFL glyph or page crop, class/id labels, hover highlights neighbours, drag moves nodes); augmentation next to real scans; source pages, ground-truth and predicted **kern (`--pred-kern DIR`) engraved side by side with their match against the MEI, ordered worst first on request |
 
 Workers default to half the spare cores; set `MUSICSET_WORKERS` or `--workers`.
 Each score runs in its own process from a preloaded forkserver, so a Verovio

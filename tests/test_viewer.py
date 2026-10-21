@@ -22,7 +22,9 @@ def dataset(tmp_path_factory) -> Path:
     shutil.copy(FIXTURES / "tiny.musicxml", root / "src" / "tiny.musicxml")
     layout = Layout(root / "out")
     layout.create()
-    cfg = BuildConfig(labels=LabelSet.load("lite"), write_graph=True, write_abc=True)
+    cfg = BuildConfig(
+        labels=LabelSet.load("lite"), write_graph=True, write_abc=True, write_kern=True
+    )
     build_score((root / "src" / "tiny.musicxml", layout, cfg, 0))
     return layout.root
 
@@ -165,3 +167,34 @@ def test_layout_changes_and_drags_update_positions_and_scroll_area(dataset: Path
     tab.view.centerOn(item)
     app.processEvents()
     assert tab.view.mapToScene(tab.view.viewport().rect()).boundingRect().contains(item.pos())
+
+
+def test_kern_tab_engraves_ground_truth_and_prediction(dataset: Path, tmp_path: Path):
+    import time
+
+    pred = tmp_path / "pred"
+    pred.mkdir()
+    shutil.copy(dataset / "kern" / "tiny.krn", pred / "tiny.krn")
+    app = QApplication.instance() or QApplication([])
+    window = Viewer(Dataset(dataset, LabelSet.load("lite"), pred_kern=pred))
+    window.tabs.setCurrentIndex(window.tabs.indexOf(window.kern))
+    kern = window.kern
+    assert kern.score == "tiny"
+    assert kern.columns["source"].scene.items()
+    assert "100.0%" in kern.status.text() and "1.00x" in kern.status.text()
+
+    deadline = time.monotonic() + 120
+    engraved = lambda key: any(  # noqa: E731
+        i.type() == 7 for i in kern.columns[key].scene.items()  # QGraphicsPixmapItem
+    )
+    while not (engraved("gt") and engraved("pred")) and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.05)
+    assert engraved("gt") and engraved("pred")
+    assert kern.texts["gt"].toPlainText() == (dataset / "kern" / "tiny.krn").read_text()
+
+    kern.toggles["gt"].setChecked(False)
+    assert kern.columns["gt"].isHidden()
+    assert window.order.count() == 3  # page order, worst ground truth, worst predicted
+    window.order.setCurrentIndex(2)
+    assert sorted(window.data.stems) == ["tiny_page1"]

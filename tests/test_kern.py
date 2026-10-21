@@ -127,3 +127,60 @@ def test_reference_measure_has_the_system_staves():
     assert ref(["m1", "m4"], 2, children, nodes) == "m4"  # none complete: the most staves
     children["m1"] = [("s0", 1), ("s1", 1)]
     assert ref(["m1", "m2", "m3"], 2, children, nodes) == "m1"  # ground truth: the first
+
+
+def test_signature_glyph_belongs_to_the_row_whose_band_holds_it():
+    """A grand staff's bass clef linked to the treble cell by a predicted edge
+    is not the treble staff's clef: a glyph is the staff's whose band (rows
+    split at their midpoint) holds it."""
+    from musicset.views.kern import _on_staff
+
+    rows = [{"bbox": [0, 100, 1000, 140]}, {"bbox": [0, 200, 1000, 240]}]
+    treble_cell = {"bbox": [0, 85, 500, 160]}  # content box, wider than the lines
+    assert _on_staff({"cy": 120}, treble_cell, rows)
+    assert _on_staff({"cy": 92}, treble_cell, rows)  # a sharp above the top line
+    assert not _on_staff({"cy": 220}, treble_cell, rows)  # the bass staff's clef
+    assert not _on_staff({"cy": 185}, treble_cell, rows)  # past the midpoint (170)
+    assert _on_staff({"cy": 220}, treble_cell, [])  # no rows: no geometry to judge by
+
+
+def test_event_reached_from_two_measures_is_emitted_by_the_one_holding_it():
+    """A wrong edge across the barline (measure 2's layer under measure 1's
+    staff cell) makes measure 1 reach measure 2's notes: each event is
+    emitted once, by the reaching measure whose box holds it — the narrowest
+    one, so a phantom measure spanning both never takes them."""
+    nodes = {
+        "m1": {"class": "measure", "bbox": [0, 0, 100, 50]},
+        "m2": {"class": "measure", "bbox": [100, 0, 200, 50]},
+        "m0": {"class": "measure", "bbox": [0, 0, 200, 50]},  # a phantom over both
+        "s1": {"class": "staff", "bbox": [0, 10, 100, 40]},
+        "s2": {"class": "staff", "bbox": [100, 10, 200, 40]},
+        "s0": {"class": "staff", "bbox": [0, 10, 200, 40]},
+        "l1": {"class": "layer"},
+        "l2": {"class": "layer"},
+        "n1": {"class": "note", "cx": 50.0, "cy": 25.0},
+        "n2": {"class": "note", "cx": 150.0, "cy": 25.0},
+        "n3": {"class": "note", "cx": 170.0, "cy": 25.0},
+    }
+    for node_id, node in nodes.items():
+        node["id"] = node_id
+    children = {
+        "m1": [("s1", 1)],
+        "m2": [("s2", 1)],
+        "m0": [("s0", 1)],
+        "s1": [("l1", 1), ("l2", 1)],  # l2: the wrong edge
+        "s2": [("l2", 1)],
+        "s0": [("l1", 1)],
+        "l1": [("n1", 1)],
+        "l2": [("n2", 1), ("n3", 1)],
+    }
+    serializer = MinimalHumdrumSerializer([], {})
+    owner = serializer._measure_owners(["m1", "m2", "m0"], children, nodes)
+    assert owner == {"n1": "m1", "n2": "m2", "n3": "m2"}
+
+    serializer._measure_owner = owner
+    rows = [[0, 10, 200, 40]]
+    events = serializer._events_by_staff_band(["s1"], rows, children, nodes, measure_id="m1")
+    assert [e["id"] for e in events["s1"][0]] == ["n1"]
+    events = serializer._events_by_staff_band(["s2"], rows, children, nodes, measure_id="m2")
+    assert sorted(e["id"] for e in events["s2"][0]) == ["n2", "n3"]
