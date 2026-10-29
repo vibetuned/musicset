@@ -84,3 +84,37 @@ def test_place_links_and_resolves_name_clashes(tmp_path: Path):
     assert [p.name for p in placed] == ["same.musicxml", "same_y.musicxml"]
     assert all(p.is_symlink() for p in placed)
     assert place([a], tmp_path / "out") == [tmp_path / "out" / "same.musicxml"]
+
+
+def test_per_staves_caps_and_only_list(tmp_path: Path):
+    singles = [
+        score_stats(_write(tmp_path, f"s{i}", _score([f"<measure>{_note()}</measure>"])))
+        for i in range(4)
+    ]
+    grands = [
+        score_stats(
+            _write(
+                tmp_path,
+                f"g{i}",
+                _score([f"<measure>{STAVES_2}{_note('1')}{_note('2')}</measure>"]),
+            )
+        )
+        for i in range(2)
+    ]
+    chosen = Selection(lite=True, per_staves=(2, 2)).choose(singles + grands)
+    assert sorted(s.max_staves for s in chosen) == [1, 1, 2, 2]
+    only = frozenset({"s0", "g1"})
+    assert {s.path.stem for s in Selection(lite=True, only=only).choose(singles + grands)} == only
+
+
+def test_dedup_keeps_one_copy_and_no_holdout_duplicate(tmp_path: Path):
+    tune = _score([f"<measure>{_note()}{_note(alter='1')}</measure>"])
+    other = _score([f"<measure>{_note()}{_note()}</measure>"])
+    stats = [
+        score_stats(_write(tmp_path, name, xml))
+        for name, xml in [("a", tune), ("b", tune), ("c", other), ("held", other)]
+    ]
+    assert stats[0].fingerprint == stats[1].fingerprint != stats[2].fingerprint
+    chosen = Selection(lite=True, dedup=True, exclude=frozenset({"held"})).choose(stats)
+    # one of a/b; c duplicates the holdout score
+    assert len(chosen) == 1 and chosen[0].path.stem in {"a", "b"}

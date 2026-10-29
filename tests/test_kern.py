@@ -184,3 +184,97 @@ def test_event_reached_from_two_measures_is_emitted_by_the_one_holding_it():
     assert [e["id"] for e in events["s1"][0]] == ["n1"]
     events = serializer._events_by_staff_band(["s2"], rows, children, nodes, measure_id="m2")
     assert sorted(e["id"] for e in events["s2"][0]) == ["n2", "n3"]
+
+
+def _changes_score() -> str:
+    """Two staves, four measures on one system: three flats, then five sharps
+    from measure 3 and 3/4 from measure 4. G and B change spelling with the key."""
+
+    def measure(n: int, attrs: str, beats: int) -> str:
+        notes = "".join(
+            f"<note><pitch><step>{step}</step><octave>{octave}</octave></pitch>"
+            f"<duration>{beats}</duration><type>half</type>"
+            + ("<dot/>" if beats == 3 else "")
+            + f"<staff>{staff}</staff></note>"
+            + (f"<backup><duration>{beats}</duration></backup>" if staff == 1 else "")
+            for staff, step, octave in ((1, "G", 4), (2, "B", 2))
+        )
+        return f'<measure number="{n}">{attrs}{notes}</measure>'
+
+    first = (
+        "<attributes><divisions>1</divisions><key><fifths>-3</fifths></key>"
+        "<time><beats>2</beats><beat-type>4</beat-type></time><staves>2</staves>"
+        '<clef number="1"><sign>G</sign><line>2</line></clef>'
+        '<clef number="2"><sign>F</sign><line>4</line></clef></attributes>'
+    )
+    key = "<attributes><key><fifths>5</fifths></key></attributes>"
+    meter = "<attributes><time><beats>3</beats><beat-type>4</beat-type></time></attributes>"
+    body = measure(1, first, 2) + measure(2, "", 2) + measure(3, key, 2) + measure(4, meter, 3)
+    return (
+        '<score-partwise version="3.1"><part-list><score-part id="P1">'
+        "<part-name>Piano</part-name></score-part></part-list>"
+        f'<part id="P1">{body}</part></score-partwise>'
+    )
+
+
+def test_mid_system_key_and_meter_changes_open_their_own_measure(tmp_path: Path):
+    """A key or meter change is a scoreDef in MEI, drawn with a generated id:
+    the graph attached it to the system's first measure, and the kern
+    respelled every measure from there."""
+    from musicset.evaluate import score_kern
+
+    (tmp_path / "src").mkdir()
+    source = tmp_path / "src" / "changes.musicxml"
+    source.write_text(_changes_score(), encoding="utf-8")
+    layout = Layout(tmp_path / "out")
+    layout.create()
+    build_score((source, layout, BuildConfig(labels=LabelSet.load("lite"), write_kern=True), 0))
+    kern = (layout.kern / "changes.krn").read_text()
+    assert kern.index("*k[f#c#g#d#a#]") > kern.index("=2")
+    assert kern.index("*M3/4") > kern.index("=3")
+    quality = score_kern(layout.mei / "changes.mei", layout.kern / "changes.krn")
+    assert (quality["pitch"], quality["rhythm"], quality["precision"]) == (100.0, 100.0, 100.0)
+
+
+def test_ledger_notes_far_off_the_staff_keep_their_pitch(tmp_path: Path):
+    """Pitch is read off the row box at height / 8 per step: the box must span
+    line centres, or with heavy staff lines notes four ledger lines out read a
+    step low."""
+    from musicset.evaluate import score_kern
+    from musicset.render.options import RenderOptions
+
+    notes = "".join(
+        f"<note><pitch><step>{step}</step><octave>{octave}</octave></pitch>"
+        "<duration>1</duration><type>quarter</type></note>"
+        for step, octave in (
+            ("G", 7),
+            ("E", 7),
+            ("C", 7),
+            ("A", 6),
+            ("C", 3),
+            ("A", 2),
+            ("F", 2),
+            ("D", 2),
+        )
+    )
+    xml = (
+        '<score-partwise version="3.1"><part-list><score-part id="P1"><part-name>V</part-name>'
+        '</score-part></part-list><part id="P1"><measure number="1"><attributes>'
+        "<divisions>1</divisions><key><fifths>0</fifths></key>"
+        "<time><beats>8</beats><beat-type>4</beat-type></time>"
+        "<clef><sign>G</sign><line>2</line></clef></attributes>"
+        f"{notes}</measure></part></score-partwise>"
+    )
+    (tmp_path / "src").mkdir()
+    source = tmp_path / "src" / "ledgers.musicxml"
+    source.write_text(xml, encoding="utf-8")
+    layout = Layout(tmp_path / "out")
+    layout.create()
+    cfg = BuildConfig(
+        render=RenderOptions(extra={"staffLineWidth": 0.3}),
+        labels=LabelSet.load("lite"),
+        write_kern=True,
+    )
+    build_score((source, layout, cfg, 0))
+    quality = score_kern(layout.mei / "ledgers.mei", layout.kern / "ledgers.krn")
+    assert quality["pitch"] == 100.0

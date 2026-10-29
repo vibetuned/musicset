@@ -246,17 +246,34 @@ class _GraphBuilder:
                     self.edges.append((system["id"], measure["id"], 1))
                     break
 
-        # Staff -> clefs / key and time signatures not reached through MEI
+        # Staff -> clefs / key and time signatures not reached through MEI: the
+        # staff of the measure they are drawn in, i.e. the last one starting
+        # left of them on their row. Signatures restated at a system start sit
+        # in its first measure; a key or meter change (a scoreDef in MEI, drawn
+        # with a generated id) in the measure it opens. Taking the row's first
+        # staff moved every mid-system change to the start of its system, and
+        # the kern respelled the measures before it
         staves = [n for n in nodes if n.get("class") == "staff"]
         children = {child for _, child, _ in self.edges}
         for node in nodes:
             if node["class"] in context and node.get("id") and node["id"] not in children:
-                _, n_cy = _center(node["bbox"])
-                for staff in staves:
-                    same_page = staff.get("_page") == node.get("_page")
-                    if same_page and staff["bbox"][1] <= n_cy <= staff["bbox"][3]:
-                        self.edges.append((staff["id"], node["id"], 1))
-                        break
+                n_cx, n_cy = _center(node["bbox"])
+                row = [
+                    s
+                    for s in staves
+                    if s.get("_page") == node.get("_page") and s["bbox"][1] <= n_cy <= s["bbox"][3]
+                ]
+                if not row:
+                    continue
+                started = [s for s in row if s["bbox"][0] <= n_cx] or row
+                x1 = max(s["bbox"][0] for s in started)
+                # staves of one measure share their left edge; the glyph's own
+                # staff is centred nearest to it
+                staff = min(
+                    (s for s in started if s["bbox"][0] == x1),
+                    key=lambda s: abs(_center(s["bbox"])[1] - n_cy),
+                )
+                self.edges.append((staff["id"], node["id"], 1))
 
         # Note -> dots and other attribute-encoded modifiers: the event the
         # glyph is drawn inside (detection ``parent``), else the nearest event.

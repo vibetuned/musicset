@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 
 import music21
 
-from musicset.synth.theory import ALL_METERS, DETECTOR_METERS
+from musicset.synth.theory import ALL_METERS, DETECTOR_METERS, octave
 
 ORNAMENTS = {
     "trill": music21.expressions.Trill,
@@ -65,12 +65,20 @@ class Profile:
     """Per note of a fingered score."""
     double_barline: float = 0.0
     """Per measure (same positions in every part)."""
+    dashed_barline: float = 0.0
+    """Per measure without a double barline."""
     clef_change: float = 0.0
     """Per part: a treble/bass switch for a measure or two."""
+    c_clef_change: float = 0.0
+    """Share of those switches to (or, on a C-clef part, from) an alto or
+    tenor clef: the cClefChange glyph, rare in real lite scores."""
     octave_clef: float = 0.0
     """Per treble part: switch to an 8va/8vb treble clef partway."""
     octave_8va: float = 0.65
     """Share of octave clefs that are 8va."""
+    c_clef: float = 0.0
+    """Per single-staff score: an alto or tenor clef, the music moved by
+    octaves to sit on it (real lite scores have a C clef on ~1% of pages)."""
     ottava: float = 0.0
     """Per part: an 8va/8vb bracket over a few notes."""
     key_change: float = 0.0
@@ -103,20 +111,45 @@ PROFILES: dict[str, Profile] = {
         durations=(4.0, 2.0, 1.0, 0.5, 0.25, 0.125),
         duration_weights=(0.08, 0.14, 0.33, 0.24, 0.14, 0.07),
         ornaments=("trill", "trill", "mordent", "mordent", "turn", "fermata"),
-        dynamics=("pp", "pp", "mp", "mp", "ff", "ff", "p", "z", "sfz", "fz", "mf", "f"),
+        # mfp and sfffz have no combined glyph: Verovio sets their letters,
+        # the only source of the lone m and s glyphs
+        dynamics=(
+            "pp",
+            "pp",
+            "mp",
+            "mp",
+            "ff",
+            "ff",
+            "fff",
+            "p",
+            "z",
+            "sfz",
+            "fz",
+            "mf",
+            "f",
+            "mfp",
+            "sfffz",
+        ),
         fingered=1.0,
         fingering=1.0,
         double_barline=0.10,
+        dashed_barline=0.03,
         clef_change=0.25,
+        c_clef_change=0.3,
         octave_clef=0.40,
+        c_clef=0.15,
         ottava=0.30,
         key_change=0.35,
         measure_rest=0.04,
     ),
 }
 # The detector profile's rare-class weighting without its fingering flood
-# (a digit on every note: 41k boxes in 120 scores, a class nothing reads)
-PROFILES["rare"] = PROFILES["detector"].with_(name="rare", fingered=0.2, fingering=0.5)
+# (a digit on every note: 41k boxes in 120 scores, a class nothing reads) and
+# with a third of its ornaments: one note in 17 ornamented taught the detector
+# to read real fermatas as mordents, turns and trills
+PROFILES["rare"] = PROFILES["detector"].with_(
+    name="rare", fingered=0.2, fingering=0.5, ornament=0.02
+)
 
 
 def profile(name: str | Profile) -> Profile:
@@ -248,40 +281,89 @@ def _same_pitches(a: music21.note.GeneralNote, b: music21.note.GeneralNote) -> b
 
 
 def add_double_barlines(
-    score: music21.stream.Score, rate: float, rng: random.Random, first: int = 3
+    score: music21.stream.Score,
+    rate: float,
+    rng: random.Random,
+    first: int = 3,
+    dashed: float = 0.0,
 ) -> None:
-    """Double barlines at phrase boundaries, same positions in every part."""
+    """Double barlines at phrase boundaries, and (``dashed`` per measure)
+    dashed ones elsewhere, same positions in every part."""
     parts = _parts(score)
-    if not parts or not rate:
+    if not parts or not (rate or dashed):
         return
     n = len(_measures(parts[0]))
-    positions = {i for i in range(first, n - 1) if rng.random() < rate}
+    styles = {}
+    for i in range(first, n - 1):
+        r = rng.random()
+        if r < rate:
+            styles[i] = "double"
+        elif r < rate + dashed:
+            styles[i] = "dashed"
     for part in parts:
         for i, m in enumerate(_measures(part)):
-            if i in positions:
-                m.rightBarline = music21.bar.Barline("double")
+            if i in styles:
+                m.rightBarline = music21.bar.Barline(styles[i])
 
 
 def _first_clef(part: music21.stream.Part) -> music21.clef.Clef | None:
     return part.recurse().getElementsByClass(music21.clef.Clef).first()
 
 
-def add_clef_changes(score: music21.stream.Score, rate: float, rng: random.Random) -> None:
-    """Switch treble/bass for a measure or two, then switch back."""
+def add_clef_changes(
+    score: music21.stream.Score, rate: float, rng: random.Random, c_share: float = 0.0
+) -> None:
+    """Switch clef for a measure or two, then switch back: treble/bass, or
+    (``c_share`` of the switches) to an alto/tenor clef; a part on a C clef
+    switches to treble or bass."""
     for part in _parts(score):
         measures = _measures(part)
         if len(measures) < 6 or rng.random() >= rate:
             continue
         current = _first_clef(part)
+        to_c = c_share > 0 and rng.random() < c_share
         if isinstance(current, music21.clef.TrebleClef) and not current.octaveChange:
-            change, restore = music21.clef.BassClef(), music21.clef.TrebleClef()
+            change = music21.clef.AltoClef() if to_c else music21.clef.BassClef()
+            restore = music21.clef.TrebleClef()
         elif isinstance(current, music21.clef.BassClef):
-            change, restore = music21.clef.TrebleClef(), music21.clef.BassClef()
+            change = music21.clef.TenorClef() if to_c else music21.clef.TrebleClef()
+            restore = music21.clef.BassClef()
+        elif isinstance(current, music21.clef.AltoClef):
+            change, restore = music21.clef.TrebleClef(), music21.clef.AltoClef()
+        elif isinstance(current, music21.clef.TenorClef):
+            change, restore = music21.clef.BassClef(), music21.clef.TenorClef()
         else:
             continue
         i = rng.randint(2, len(measures) - 3)
         measures[i].insert(0.0, change)
         measures[min(i + rng.randint(1, 2), len(measures) - 1)].insert(0.0, restore)
+
+
+def add_c_clefs(score: music21.stream.Score, rate: float, rng: random.Random) -> None:
+    """Set a single-staff score on an alto or tenor clef, every note moved by
+    whole octaves (spelling kept) so the music sits on that staff."""
+    parts = _parts(score)
+    if len(parts) != 1 or rng.random() >= rate:
+        return
+    part = parts[0]
+    current = _first_clef(part)
+    if current is None or current.activeSite is None or getattr(current, "octaveChange", 0):
+        return
+    if not isinstance(current, (music21.clef.TrebleClef, music21.clef.BassClef)):
+        return
+    pitches = sorted(p.midi for n in part.recurse().notes for p in n.pitches)
+    if not pitches:
+        return
+    # middle line: C4 on the alto staff, A3 on the tenor staff
+    clef, middle = rng.choice(((music21.clef.AltoClef(), 60), (music21.clef.TenorClef(), 57)))
+    shift = round((middle - pitches[len(pitches) // 2]) / 12)
+    if shift:
+        for n in part.recurse().notes:
+            if n.isChord:
+                n.pitches = tuple(octave(q, shift) for q in n.pitches)
+            else:
+                n.pitch = octave(n.pitch, shift)
+    current.activeSite.replace(current, clef)
 
 
 def add_octave_clefs(
@@ -414,8 +496,9 @@ def decorate(
             add_ties(part, p, rng)
         add_dynamics(part, p, rng)
         add_slurs(part, p, rng)
-    add_double_barlines(score, p.double_barline, rng)
-    add_clef_changes(score, p.clef_change, rng)
+    add_double_barlines(score, p.double_barline, rng, dashed=p.dashed_barline)
+    add_c_clefs(score, p.c_clef, rng)
+    add_clef_changes(score, p.clef_change, rng, c_share=p.c_clef_change)
     add_octave_clefs(score, p.octave_clef, p.octave_8va, rng)
     add_ottavas(score, p.ottava, rng)
     add_key_changes(score, p.key_change, rng)

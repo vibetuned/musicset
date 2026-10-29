@@ -65,9 +65,6 @@ _NUMBER = re.compile(r"[-+]?[0-9]*\.?[0-9]+")
 
 # Children that make up a measure's own extent
 _MEASURE_BODY = frozenset({"staff", "barLine"})
-# Staff lines closer than this (SVG units, vertically) are merged into one
-# system-staff box
-_SYSTEM_STAFF_MERGE = 1000
 # Beam polygons closer than this (SVG units) count as the same beam level
 _BEAM_LEVEL_TOLERANCE = 20
 
@@ -463,29 +460,50 @@ class _Extractor:
     # -- derived classes ----------------------------------------------------
 
     def _system_staves(self, system: ET.Element) -> list[BBox]:
-        """One box per group of staff lines in a system."""
-        lines: list[BBox] = []
+        """One box per staff of a system, across its measures, top to bottom.
+
+        Verovio draws each staff once per measure as its own group of lines:
+        the same staff overlaps itself vertically in every measure and two
+        staves never overlap. Merging line centres within a fixed distance
+        instead ran a grand staff's treble box into the bass staff (and left a
+        sliver over the bass's last lines) whenever the varied profile set the
+        staves close together.
+
+        A box runs from the top line's centre to the bottom line's, exactly
+        four staff spaces: pitch is read off it at height / 8 per step, and
+        half a stroke at each end put notes four ledger lines out a step off.
+        """
+        spans: list[BBox] = []
         for staff in system.findall(".//svg:g", _NS):
             if "staff" not in _classes(staff):
                 continue
+            lines: list[BBox] = []
             for path in staff.findall("./svg:path", _NS):
                 if not (path.get("d") and path.get("stroke-width")):
                     continue
                 try:
-                    lines.append(transform_bbox(self.matrix(path), _path_bbox(path)))
+                    xmin, xmax, ymin, ymax = parse_path(path.get("d", "")).bbox()
+                    lines.append(transform_bbox(self.matrix(path), (xmin, ymin, xmax, ymax)))
                 except Exception:
                     continue
+            if lines:
+                spans.append(
+                    (
+                        min(b[0] for b in lines),
+                        min(b[1] for b in lines),
+                        max(b[2] for b in lines),
+                        max(b[3] for b in lines),
+                    )
+                )
 
         clusters: list[list[float]] = []
-        for x1, y1, x2, y2 in lines:
-            y_center = (y1 + y2) / 2
-            for cluster in clusters:
-                if abs(y_center - (cluster[1] + cluster[3]) / 2) < _SYSTEM_STAFF_MERGE:
-                    cluster[0] = min(cluster[0], x1)
-                    cluster[2] = max(cluster[2], x2)
-                    cluster[1] = min(cluster[1], y1)
-                    cluster[3] = max(cluster[3], y2)
-                    break
+        for x1, y1, x2, y2 in sorted(spans, key=lambda b: (b[1] + b[3]) / 2):
+            last = clusters[-1] if clusters else None
+            if last is not None and y1 < last[3] and last[1] < y2:
+                last[0] = min(last[0], x1)
+                last[1] = min(last[1], y1)
+                last[2] = max(last[2], x2)
+                last[3] = max(last[3], y2)
             else:
                 clusters.append([x1, y1, x2, y2])
         return [(c[0], c[1], c[2], c[3]) for c in clusters]
@@ -507,10 +525,13 @@ class _Extractor:
         if len(xs) == 1:
             dashed = by_x[xs[0]][0].get("stroke-dasharray")
             return ["barlineDashed" if dashed else "barlineSingle"]
-        if len(xs) == 2:
-            sw1 = float(by_x[xs[0]][0].get("stroke-width", 1))
-            sw2 = float(by_x[xs[1]][0].get("stroke-width", 1))
-            return ["barlineFinal" if sw1 != sw2 else "barlineDouble"]
+        if xs:
+            # Strokes of mixed weight are a final or repeat barline (one-sided
+            # repeats are thin-thick; Verovio draws an end-and-start repeat
+            # :|: as thin-thick-thin, which went unlabelled on a third of
+            # PDMX pages); equal strokes a double barline
+            widths = {float(by_x[x][0].get("stroke-width", 1)) for x in xs}
+            return ["barlineFinal" if len(widths) > 1 else "barlineDouble"]
         return []
 
     def _beam_shape(self, beam: ET.Element) -> tuple[int, int, bool]:

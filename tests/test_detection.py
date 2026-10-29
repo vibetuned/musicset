@@ -1,4 +1,11 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from musicset import ClassMap, Element, Glyph, PageAnnotation, detection_annotations
+
+LABELS = Path(__file__).parents[1] / "src" / "musicset" / "labels"
 
 
 def _page(elements: list[Element], glyphs: list[Glyph] | None = None) -> PageAnnotation:
@@ -71,3 +78,18 @@ def test_tiny_score_labels(tiny_page: PageAnnotation):
     assert sorted(labels) == sorted(
         ["keyAccidSharp", "accidentalSharp", "stem32", "barlineFinal", *["noteheadBlack"] * 8]
     )
+
+
+@pytest.mark.parametrize("name", ["lite", "full", "lite-pruned"])
+def test_articulation_glyphs_map_to_their_own_class(name: str):
+    """SMuFL articulations come in above/below pairs: each glyph, wherever it
+    is drawn, is labelled with its articulation (the class names say Above)."""
+    from musicset.annotate.smufl import glyph_name
+
+    mapping = json.loads((LABELS / name / "smufl_mapping.json").read_text())
+    articulations = {c: cls for c, cls in mapping.items() if c.startswith("E4A")}
+    assert {"E4A2", "E4A3"} <= articulations.keys()  # staccato, the commonest
+    for code, cls in articulations.items():
+        family = glyph_name(code).replace("Below", "Above")
+        family = family.replace("Wedge", "").replace("Stroke", "")
+        assert family == cls, (code, glyph_name(code), cls)

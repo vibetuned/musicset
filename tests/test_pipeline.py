@@ -110,12 +110,50 @@ def test_page_limit_rejects_and_cleans_up(sources: Path, tmp_path: Path):
     assert not (layout.injected / "tiny.mxl").exists()
 
 
+def test_rejection_on_rebuild_removes_every_artifact(sources: Path, tmp_path: Path):
+    """A score built once, then rejected by a gate on a rebuild with other
+    settings, must not leave its MEI, graph or kern behind."""
+    layout = Layout(tmp_path / "out")
+    _build(sources, layout, BuildConfig(labels=LITE, write_graph=True, write_kern=True))
+    assert (layout.mei / "tiny.mei").exists() and (layout.kern / "tiny.krn").exists()
+    gated = BuildConfig(labels=LITE, write_graph=True, write_kern=True, max_notes_per_measure=5)
+    with pytest.raises(Rejected, match="notes per measure"):
+        _build(sources, layout, gated)
+    for d in (layout.mei, layout.graphs, layout.kern, layout.manifest, layout.injected):
+        assert not any(d.iterdir()), d
+
+
 def test_density_gate_rejects_and_cleans_up(sources: Path, tmp_path: Path):
     layout = Layout(tmp_path / "out")
     with pytest.raises(Rejected, match="notes per measure"):
         _build(sources, layout, BuildConfig(max_notes_per_measure=5))
     assert not any(layout.svgs.iterdir()) and not any(layout.imgs.iterdir())
     assert not (layout.injected / "tiny.mxl").exists()
+
+
+def test_kern_quality_is_recorded_and_gates_the_build(
+    sources: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg = BuildConfig(labels=LITE, write_kern=True, min_kern_pitch=99, min_kern_rhythm=98)
+    layout = Layout(tmp_path / "out")
+    _build(sources, layout, cfg)
+    quality = json.loads((layout.manifest / "tiny.json").read_text())["kern_quality"]
+    assert quality["pitch"] == quality["rhythm"] == quality["precision"] == 100.0
+
+    # a kern that loses notes against its MEI: the score is rejected, nothing kept
+    def poor(mei: Path, krn: Path) -> dict:
+        return {"pitch": 90.0, "rhythm": 90.0, "precision": 90.0, "ratio": 1.0, "notes": 10}
+
+    monkeypatch.setattr("musicset.pipeline.kern_quality", poor)
+    layout = Layout(tmp_path / "gated")
+    with pytest.raises(Rejected, match="kern vs MEI pitch 90"):
+        _build(sources, layout, cfg)
+    leftovers = [
+        p
+        for d in (layout.root / x for x in ("imgs", "mei", "kern", "manifest", "injected"))
+        for p in d.iterdir()
+    ]
+    assert leftovers == []
 
 
 def test_cli_build_detection_and_graph(sources: Path, tmp_path: Path):

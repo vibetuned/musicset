@@ -99,36 +99,61 @@ def mei_bags(path: Path) -> tuple[dict, dict]:
     root = ET.parse(path).getroot()
     parents = {child: parent for parent in root.iter() for child in parent}
 
-    keysigs, ppqs = {}, {}
+    ppqs = {}
     for sd in root.iter(f"{MEI_NS}staffDef"):
-        n = sd.get("n")
-        if n in keysigs:
-            continue  # keep the initial signature; mid-piece changes are rare
-        ks = sd.find("mei:keySig", NS)
-        sig = ks.get("sig") if ks is not None else sd.get("key.sig")
-        keysigs[n] = _keysig_alters(sig)
-        ppq = sd.get("ppq")
-        if ppq:
+        n, ppq = sd.get("n"), sd.get("ppq")
+        if ppq and n not in ppqs:
             ppqs[n] = float(ppq)
 
+    # Key signatures in force, followed through the document in order: a
+    # scoreDef's signature applies to every staff, a staffDef's or a keySig
+    # drawn inside a staff to that staff. Keeping only the opening one scored
+    # every measure after a key change against the old key
+    score_key: dict = {}
+    keys: dict[str | None, dict] = {}
+
+    def set_key(context: ET.Element | None, sig: str | None) -> None:
+        nonlocal score_key
+        alters = _keysig_alters(sig)
+        if context is not None and context.tag == f"{MEI_NS}scoreDef":
+            score_key = alters
+            keys.clear()
+            return
+        while context is not None and context.tag not in (
+            f"{MEI_NS}staffDef",
+            f"{MEI_NS}staff",
+        ):
+            context = parents.get(context)
+        if context is not None:
+            keys[context.get("n")] = alters
+
     pitch_bags, rhythm_bags = {}, {}
-    for m_idx, measure in enumerate(root.iter(f"{MEI_NS}measure"), start=1):
-        for staff in measure.findall("mei:staff", NS):
-            n = staff.get("n")
-            carry = {}
+    m_idx, n, carry = 0, None, {}
+    p_bag: Counter = Counter()
+    r_bag: Counter = Counter()
+    for el in root.iter():
+        tag = el.tag
+        if tag in (f"{MEI_NS}scoreDef", f"{MEI_NS}staffDef") and el.get("key.sig"):
+            set_key(el, el.get("key.sig"))
+        elif tag == f"{MEI_NS}keySig" and el.get("sig") is not None:
+            set_key(parents.get(el), el.get("sig"))
+        elif tag == f"{MEI_NS}measure":
+            m_idx += 1
+        elif tag == f"{MEI_NS}staff" and m_idx:
+            n, carry = el.get("n"), {}
             p_bag, r_bag = Counter(), Counter()
-            for note in staff.iter(f"{MEI_NS}note"):
-                pname, oct_ = note.get("pname"), note.get("oct")
-                if pname is None or oct_ is None:
-                    continue  # unpitched (percussion 'loc' notation)
-                letter, octave = pname.upper(), int(oct_)
-                alter = _note_alter(note, parents, keysigs.get(n, {}), carry)
-                p_bag[(letter, octave, alter)] += 1
-                value = _note_value(note, parents, ppqs.get(n, 0.0))
-                if value is not None:
-                    r_bag[(letter, octave, alter, round(value, 4))] += 1
             pitch_bags[(n, m_idx)] = p_bag
             rhythm_bags[(n, m_idx)] = r_bag
+        elif tag == f"{MEI_NS}note" and n is not None:
+            pname, oct_ = el.get("pname"), el.get("oct")
+            if pname is None or oct_ is None:
+                continue  # unpitched (percussion 'loc' notation)
+            letter, octave = pname.upper(), int(oct_)
+            alter = _note_alter(el, parents, keys.get(n, score_key), carry)
+            p_bag[(letter, octave, alter)] += 1
+            value = _note_value(el, parents, ppqs.get(n, 0.0))
+            if value is not None:
+                r_bag[(letter, octave, alter, round(value, 4))] += 1
     return pitch_bags, rhythm_bags
 
 

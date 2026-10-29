@@ -22,6 +22,7 @@ import music21
 
 from musicset.synth.decorate import (
     Profile,
+    add_c_clefs,
     add_clef_changes,
     add_double_barlines,
     add_key_changes,
@@ -310,8 +311,9 @@ def generate(rng: random.Random, cfg: ExerciseConfig | None = None) -> music21.s
         score.insert(0, part)
     if len(staves) == 2:
         score.insert(0, music21.layout.StaffGroup(staves, symbol="brace", barTogether=True))
-    add_double_barlines(score, p.double_barline, rng)
-    add_clef_changes(score, p.clef_change, rng)
+    add_double_barlines(score, p.double_barline, rng, dashed=p.dashed_barline)
+    add_c_clefs(score, p.c_clef, rng)
+    add_clef_changes(score, p.clef_change, rng, c_share=p.c_clef_change)
     add_octave_clefs(score, p.octave_clef, p.octave_8va, rng)
     add_ottavas(score, p.ottava, rng)
     add_measure_rests(score, p.measure_rest, rng)

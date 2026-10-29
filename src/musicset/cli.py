@@ -59,15 +59,26 @@ def _report(results, total: int, desc: str, unit: str) -> list[str]:
     return errors
 
 
+def _stem_list(path: Path) -> list[str]:
+    """Stems listed one per line (blank lines and # comments skipped)."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [s for line in lines if (s := line.split("#", 1)[0].strip())]
+
+
 def cmd_select(args: argparse.Namespace) -> None:
     sources = find_sources(args.sources)
     exclude = frozenset(p.stem for d in args.exclude_from for p in find_sources(d))
+    if args.exclude_list:
+        exclude |= frozenset(_stem_list(args.exclude_list))
     selection = Selection(
         lite=args.lite,
         max_voices=args.max_voices,
         per_voice=tuple(args.per_voice),
+        per_staves=tuple(args.per_staves),
         limit=args.limit,
         exclude=exclude,
+        only=frozenset(_stem_list(args.only)) if args.only else None,
+        dedup=args.dedup,
         seed=args.seed,
     )
     stats = []
@@ -83,13 +94,17 @@ def cmd_select(args: argparse.Namespace) -> None:
     place(chosen, args.out, copy=args.copy)
     with (args.out / "selection.jsonl").open("w", encoding="utf-8") as f:
         f.writelines(json.dumps(s.to_dict()) + "\n" for s in chosen)
+    accepted = Counter(s.max_staves for s in stats if selection.accepts(s))
     by_voices = Counter(s.voices for s in chosen)
+    by_staves = Counter(s.max_staves for s in chosen)
     logger.info(
-        "selected %d of %d scores into %s (by voice count: %s)",
+        "selected %d of %d scores into %s (by voice count: %s; by staff count: %s of %s accepted)",
         len(chosen),
         len(sources),
         args.out,
         dict(sorted(by_voices.items())),
+        dict(sorted(by_staves.items())),
+        dict(sorted(accepted.items())),
     )
 
 
@@ -123,6 +138,8 @@ def cmd_build(args: argparse.Namespace) -> None:
         max_pages=args.max_pages,
         max_measures_per_system=args.max_measures_per_system,
         max_notes_per_measure=args.max_notes_per_measure,
+        min_kern_pitch=args.min_kern_pitch,
+        min_kern_rhythm=args.min_kern_rhythm,
         profile=args.profile,
         seed=args.seed,
         variants=args.variants,
@@ -367,6 +384,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--per-voice", type=int, nargs="*", default=[], help="cap per voice count 1, 2, 3..."
     )
+    p.add_argument(
+        "--per-staves", type=int, nargs="*", default=[], help="cap per staff count 1, 2..."
+    )
+    p.add_argument(
+        "--only", type=Path, help="file of stems (one per line): select among these only"
+    )
     p.add_argument("--limit", type=int, default=0, help="at most N scores in total")
     p.add_argument(
         "--exclude-from",
@@ -374,6 +397,12 @@ def main(argv: list[str] | None = None) -> None:
         nargs="*",
         default=[],
         help="never pick scores present in these directories (holdout safety)",
+    )
+    p.add_argument("--exclude-list", type=Path, help="file of stems (one per line) never to pick")
+    p.add_argument(
+        "--dedup",
+        action="store_true",
+        help="one score per music content; none duplicating an excluded score",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--copy", action="store_true", help="copy instead of symlinking")
@@ -407,6 +436,18 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument(
         "--max-notes-per-measure", type=float, default=0, help="reject barless sources (try 40)"
+    )
+    p.add_argument(
+        "--min-kern-pitch",
+        type=float,
+        default=0,
+        help="reject scores whose kern scores below this pitch recall/precision vs their MEI",
+    )
+    p.add_argument(
+        "--min-kern-rhythm",
+        type=float,
+        default=0,
+        help="reject scores whose kern scores below this rhythm recall vs their MEI",
     )
     p.add_argument("--limit", type=int, default=0, help="only the first N sources")
     p.add_argument("--timeout", type=float, default=120.0, help="seconds per score")

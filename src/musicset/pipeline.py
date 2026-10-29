@@ -33,6 +33,7 @@ from typing import Any
 
 from musicset.annotate.extract import annotate_svg
 from musicset.annotate.schema import SCHEMA_VERSION, PageAnnotation
+from musicset.evaluate import score_kern as kern_quality
 from musicset.ids import id_prefix, inject_ids
 from musicset.labels import LabelSet
 from musicset.render.engrave import Engraving, rasterize
@@ -46,10 +47,10 @@ from musicset.views.kern import score_kern
 from musicset.views.paginate import page_musicxml
 
 # Bump when extraction output changes for the same SVG, to invalidate builds
-EXTRACTOR_VERSION = 3
+EXTRACTOR_VERSION = 5
 # Bump when the detection, graph or kern views change for the same canonical
 # pages: builds re-project them from pages/ and mei/ without rendering
-VIEWS_VERSION = 2
+VIEWS_VERSION = 4
 
 PAGE_SUFFIX = ".json.gz"
 
@@ -153,6 +154,14 @@ class BuildConfig:
     max_notes_per_measure: float = 0
     """Reject pages averaging more notes per measure (0: no limit). Sources
     without barlines engrave as one giant measure; kakigori used 40."""
+    min_kern_pitch: float = 0
+    """Reject scores whose kern, read back against their own MEI, scores a
+    lower pitch recall or precision (percent; 0: keep all). The kern is read
+    off the annotations and graph like a model's, so a score it cannot
+    represent (irregular measures, hidden tuplets...) has groundtruth the
+    page does not show."""
+    min_kern_rhythm: float = 0
+    """Same, for pitch + duration recall."""
     profile: str = "fixed"
     """``fixed``: every score engraved with ``render``. ``varied``: options
     sampled per score and variant (font, staff size, line weights, spacing,
@@ -170,6 +179,8 @@ class BuildConfig:
             self.labels is None or not self.labels.has_graph_roles
         ):
             raise ValueError("graphs and kern need a label set with node roles (structure.json)")
+        if (self.min_kern_pitch or self.min_kern_rhythm) and not self.write_kern:
+            raise ValueError("the kern quality gate needs the kern view")
 
     @property
     def needs_edges(self) -> bool:
@@ -214,7 +225,8 @@ class BuildConfig:
         if self.labels is None:
             return None
         flags = f"{int(self.write_graph)}{int(self.write_kern)}"
-        return f"{self.labels.fingerprint()}-{flags}-v{VIEWS_VERSION}"
+        gate = f"-q{self.min_kern_pitch:g}/{self.min_kern_rhythm:g}" if self.write_kern else ""
+        return f"{self.labels.fingerprint()}-{flags}{gate}-v{VIEWS_VERSION}"
 
 
 @dataclass(slots=True)
@@ -311,7 +323,41 @@ def _project_labels(
             (layout.kern / f"{score}.krn").unlink(missing_ok=True)
             info["kern"] = False
             info["kern_error"] = f"{type(e).__name__}: {e}"[:500]
+        if info["kern"]:
+            # the kern read back against the MEI: what the groundtruth loses
+            quality = kern_quality(layout.mei / f"{score}.mei", layout.kern / f"{score}.krn")
+            info["kern_quality"] = {k: round(v, 2) for k, v in quality.items()}
     return info
+
+
+def _remove_score(layout: Layout, score: str) -> None:
+    """Every artifact of one score."""
+    _remove_pages(layout, score)
+    for path in (
+        layout.injected / f"{score}.mxl",
+        layout.mei / f"{score}.mei",
+        layout.graphs / f"{score}.json",
+        layout.kern / f"{score}.krn",
+        layout.manifest / f"{score}.json",
+    ):
+        path.unlink(missing_ok=True)
+
+
+def _kern_gate(layout: Layout, cfg: BuildConfig, score: str, views: dict[str, Any]) -> None:
+    """Reject (and remove) a score whose kern disagrees with its MEI."""
+    if not (cfg.min_kern_pitch or cfg.min_kern_rhythm):
+        return
+    quality = views.get("kern_quality")
+    if quality is None:
+        reason = f"no kern ({views.get('kern_error', 'serialization failed')})"
+    elif min(quality["pitch"], quality["precision"]) < cfg.min_kern_pitch:
+        reason = f"kern vs MEI pitch {quality['pitch']} / precision {quality['precision']}"
+    elif quality["rhythm"] < cfg.min_kern_rhythm:
+        reason = f"kern vs MEI rhythm {quality['rhythm']}"
+    else:
+        return
+    _remove_score(layout, score)
+    raise Rejected(reason)
 
 
 def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
@@ -348,7 +394,10 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
             sizes = [(i["image_size"][0], i["image_size"][1]) for i in infos]
             manifest.pop("kern", None)
             manifest.pop("kern_error", None)
-            manifest.update(_project_labels(layout, cfg, score, pages, sizes, mei))
+            manifest.pop("kern_quality", None)
+            views = _project_labels(layout, cfg, score, pages, sizes, mei)
+            _kern_gate(layout, cfg, score, views)
+            manifest.update(views)
             manifest["labels"] = cfg.labels.name
             manifest["labels_fingerprint"] = labels_fp
             _write_json(manifest_path, manifest, indent=2)
@@ -360,7 +409,9 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
     write_mxl(layout.injected / f"{score}.mxl", musicxml)
     engraving = Engraving.load(musicxml.text, options)
     if cfg.max_pages and engraving.page_count > cfg.max_pages:
-        (layout.injected / f"{score}.mxl").unlink()
+        # every artifact: a score built before under other settings must
+        # not leave its MEI, graph or kern behind
+        _remove_score(layout, score)
         raise Rejected(f"{engraving.page_count} pages > {cfg.max_pages}")
 
     pages: list[PageAnnotation] = []
@@ -384,8 +435,7 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
         )
         page.meta["render_fingerprint"] = render_fp
         if (violation := _overflow(page) or _density_violation(page, cfg)) is not None:
-            _remove_pages(layout, score)
-            (layout.injected / f"{score}.mxl").unlink()
+            _remove_score(layout, score)
             raise Rejected(violation)
         page.save(layout.pages / f"{stem}{PAGE_SUFFIX}")
 
@@ -411,6 +461,7 @@ def build_score(task: tuple[Path, Layout, BuildConfig, int]) -> ScoreReport:
     if mei is not None:
         (layout.mei / f"{score}.mei").write_text(mei, encoding="utf-8")
     views = _project_labels(layout, cfg, score, pages, sizes, mei) if cfg.labels else {}
+    _kern_gate(layout, cfg, score, views)
 
     manifest = {
         "score": score,

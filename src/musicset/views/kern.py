@@ -44,6 +44,7 @@ import itertools
 import logging
 from dataclasses import dataclass, field
 from fractions import Fraction
+from functools import partial
 
 logger = logging.getLogger(__name__)
 
@@ -1188,12 +1189,18 @@ class MinimalHumdrumSerializer:
 
             # 3. Mid-piece signature changes: every system restates its
             # clef/keySig/meterSig on the staff — a differing value is a
-            # change that takes effect here and becomes an interpretation row
-            self._detect_signature_changes(spine, measure, staff_id, children, nodes)
-
-            # 3b. Collect events and analyze each one; mid-measure clef
-            # changes re-clef every event drawn to their right
+            # change that takes effect here and becomes an interpretation row.
+            # One drawn after the measure's last event (Verovio sets a key or
+            # meter change at the end of the measure before the one it opens)
+            # takes effect once this measure is spelled
             events, tuplet_of, beam_of, clef_marks, layer_of = staff_events[staff_id]
+            last_cx = max((ev.get("cx", 0.0) for ev in events), default=None)
+            closing = self._detect_signature_changes(
+                spine, measure, staff_id, children, nodes, after=last_cx
+            )
+
+            # 3b. Analyze each event; mid-measure clef changes re-clef every
+            # event drawn to their right
             event_infos = [
                 self._analyze_event(
                     ev,
@@ -1265,6 +1272,8 @@ class MinimalHumdrumSerializer:
                 measure.add(self._info_to_kern(info), dur, cx, info.get("id"), voice)
 
             spine.add_measure(measure)
+            for apply_change in closing:
+                apply_change()
 
         # Parts hidden in this system (optimized layout) rest through the
         # measure — pad them so every spine advances in lockstep
@@ -1278,40 +1287,66 @@ class MinimalHumdrumSerializer:
             spine.add_measure(rest_measure)
 
     @staticmethod
-    def _detect_signature_changes(spine, measure, staff_id: str, children: dict, nodes: dict):
+    def _detect_signature_changes(
+        spine, measure, staff_id: str, children: dict, nodes: dict, after: float | None = None
+    ) -> list:
         """Detect clef/key/meter restatements on a staff that differ from the
-        spine's running state; emit them as interpretation rows and update
-        the state so later measures use the new context."""
+        spine's running state and emit them as interpretation rows. Those drawn
+        left of ``after`` (the measure's last event) update the state now;
+        those right of it are returned as deferred updates, to apply once the
+        measure is spelled, so later measures use the new context."""
         staff_rows = [n for n in nodes.values() if n.get("class") == "system-staff"]
         row = _find_staff_row(nodes[staff_id], staff_rows) if staff_id in nodes else None
         row_bbox = row["bbox"] if row is not None else nodes.get(staff_id, {}).get("bbox")
+        # the running state as the glyphs are read left to right: closing
+        # glyphs compare against it, not against the measure's opening state
+        state = {"clef": spine.clef_type, "key": spine.key_token, "meter": spine.meter_token}
+        closing = []
 
+        def set_clef(value):
+            spine.clef_type = value
+
+        def set_key(token):
+            spine.key_token = token
+            spine.key_accidentals = _parse_key_accidentals(token)
+
+        def set_meter(token):
+            spine.meter_token = token
+            spine.meter_num, spine.meter_den = Spine._parse_meter(token)
+
+        glyphs = []
         for child_id, e_class in children.get(staff_id, []):
             if e_class != 1:
                 continue
             node = nodes.get(child_id)
             if not node or (staff_id in nodes and not _on_staff(node, nodes[staff_id], staff_rows)):
                 continue
-            cls_name = node["class"]
-            cx = node.get("cx", 0.0)
+            glyphs.append((node.get("cx", 0.0), child_id, node))
 
+        for cx, child_id, node in sorted(glyphs, key=lambda g: g[0]):
+            cls_name = node["class"]
             if cls_name in CLEF_BOTTOM_LINE:
-                cls_name = _resolve_clef_class(cls_name, node, row_bbox)
-                if cls_name != spine.clef_type:
-                    measure.interps.append((cx, CLEF_KERN[cls_name]))
-                    spine.clef_type = cls_name
+                kind, value = "clef", _resolve_clef_class(cls_name, node, row_bbox)
+                token, setter = CLEF_KERN[value], partial(set_clef, value)
             elif cls_name.lower() == "keysig":
-                token = Spine._keysig_token(child_id, staff_id, children, nodes)
-                if token != spine.key_token:
-                    measure.interps.append((cx, token))
-                    spine.key_token = token
-                    spine.key_accidentals = _parse_key_accidentals(token)
+                kind = "key"
+                value = token = Spine._keysig_token(child_id, staff_id, children, nodes)
+                setter = partial(set_key, token)
             elif cls_name.lower() == "metersig":
-                token = Spine._metersig_token(child_id, children, nodes)
-                if token != spine.meter_token:
-                    measure.interps.append((cx, token))
-                    spine.meter_token = token
-                    spine.meter_num, spine.meter_den = Spine._parse_meter(token)
+                kind = "meter"
+                value = token = Spine._metersig_token(child_id, children, nodes)
+                setter = partial(set_meter, token)
+            else:
+                continue
+            if value == state[kind]:
+                continue
+            state[kind] = value
+            measure.interps.append((cx, token))
+            if after is not None and cx > after:
+                closing.append(setter)
+            else:
+                setter()
+        return closing
 
     @staticmethod
     def _clef_at(cx: float, clef_marks: list, base_clef: str) -> str:

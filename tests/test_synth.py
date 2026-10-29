@@ -268,3 +268,62 @@ def test_measure_rests_keep_the_ends_and_tied_notes():
     rest = next(iter(measures[1].notesAndRests))
     assert isinstance(rest, music21.note.Rest)
     assert rest.fullMeasure is True and rest.quarterLength == 4
+
+
+def test_c_clefs_keep_spelling_and_read_back(tmp_path: Path):
+    """An alto/tenor clef with the music moved by octaves onto the staff: the
+    notes keep their spelling and the kern reads back exactly."""
+    from musicset.evaluate import score_kern
+    from musicset.synth.decorate import add_c_clefs
+
+    task = SynthTask("exercise", 3, tmp_path, profile="plain", options=(("staves", 1),))
+    score = generate(task)
+    names = [p.name for n in score.recurse().notes for p in n.pitches]
+    add_c_clefs(score, 1.0, random.Random(0))
+    clef = score.parts[0].recurse().getElementsByClass(music21.clef.Clef).first()
+    assert isinstance(clef, (music21.clef.AltoClef, music21.clef.TenorClef))
+    midi = sorted(p.midi for n in score.recurse().notes for p in n.pitches)
+    middle = 60 if isinstance(clef, music21.clef.AltoClef) else 57
+    assert abs(midi[len(midi) // 2] - middle) <= 6
+    assert [p.name for n in score.recurse().notes for p in n.pitches] == names
+
+    source = tmp_path / "cclef.musicxml"
+    write_score(score, source)
+    layout = Layout(tmp_path / "out")
+    layout.create()
+    build_score((source, layout, BuildConfig(labels=LabelSet.load("lite"), write_kern=True), 0))
+    quality = score_kern(layout.mei / "cclef.mei", layout.kern / "cclef.krn")
+    assert (quality["pitch"], quality["rhythm"]) == (100.0, 100.0)
+
+
+def test_rare_profile_features_engrave_as_their_classes(tmp_path: Path):
+    """Dashed barlines, C-clef switches and dynamics without a combined glyph
+    (mfp: lone m; sfffz: lone s) reach the page as their classes and the kern
+    still reads back exactly."""
+    from musicset.evaluate import score_kern
+    from musicset.synth import exercises
+
+    rare = PROFILES["rare"].with_(
+        dashed_barline=0.3,
+        clef_change=1.0,
+        c_clef_change=1.0,
+        dynamic=1.0,
+        dynamics=("mfp", "sfffz"),
+        key_change=0.0,
+        ottava=0.0,
+        octave_clef=0.0,
+    )
+    cfg = exercises.ExerciseConfig.from_options(profile=rare, staves=1, min_measures=8)
+    source = tmp_path / "rare.musicxml"
+    write_score(exercises.generate(random.Random(5), cfg), source)
+    layout = Layout(tmp_path / "out")
+    layout.create()
+    build_score((source, layout, BuildConfig(labels=LabelSet.load("lite"), write_kern=True), 0))
+    classes = {
+        a["class"]
+        for p in layout.annotations.glob("*.json")
+        for a in json.loads(p.read_text())["annotations"]
+    }
+    assert {"barlineDashed", "cClefChange", "dynamicMezzo", "dynamicSforzando"} <= classes
+    quality = score_kern(layout.mei / "rare.mei", layout.kern / "rare.krn")
+    assert (quality["pitch"], quality["rhythm"]) == (100.0, 100.0)
