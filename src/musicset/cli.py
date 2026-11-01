@@ -382,6 +382,8 @@ def cmd_symbols(args: argparse.Namespace) -> None:
         max_crops_per_class=args.max_crops_per_class,
         homus=args.homus,
         strokes=args.strokes,
+        emnist=args.emnist,
+        emnist_per_class=args.emnist_per_class,
         homus_copies=args.homus_copies,
         homus_brush=args.homus_brush,
         context_p=args.context_p,
@@ -631,6 +633,20 @@ def main(argv: list[str] | None = None) -> None:
         help="contributed pen strokes (JSON Lines from a score editor), split by contributor",
     )
     p.add_argument(
+        "--emnist",
+        type=Path,
+        default=None,
+        help="directory with NIST's emnist-byclass-* files: handwritten digits for the "
+        "fingerings, letters for the dynamics",
+    )
+    p.add_argument(
+        "--emnist-per-class",
+        type=int,
+        default=1000,
+        help="EMNIST words per fingering/dynamic class for train+val; test gets its share "
+        "from EMNIST's test file",
+    )
+    p.add_argument(
         "--homus-copies",
         type=int,
         default=1,
@@ -661,7 +677,6 @@ def main(argv: list[str] | None = None) -> None:
             "note",
             "rest",
             "clef",
-            "timesig",
             "barline",
         ),
         help="symbol groups to include (default: all)",

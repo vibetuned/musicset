@@ -308,8 +308,8 @@ octave clef mid-system; if they turn up, the fix is a `gClef8vaChange` /
 
 `musicset symbols OUT` builds an MNIST-like grayscale classification dataset
 (`32x32` by default, black ink on white paper; `--invert` for classic
-white-on-black, `--size` for `28`, `64`, ...) covering 33 score markings across
-six groups (`--groups`):
+white-on-black, `--size` for `28`, `64`, ...) covering 51 score markings across
+ten groups (`--groups`):
 
 - **fingering** (`fing1`..`fing5`): digits `1`–`5` only;
 - **ornament**: `trill`, `mordent`, `turn`, `fermata`, `arpeg`;
@@ -326,9 +326,6 @@ six groups (`--groups`):
 - **rest**: `restWholeHalf` (one shape, two staff positions), `restQuarter`,
   `rest8th`, `rest16th`, `rest32nd`, `rest64th`;
 - **clef**: `gClef`, `fClef`, `cClef`;
-- **timesig**: `timeSigCommon`, `timeSigCutCommon` and the digit stacks
-  `timeSig2over2`, `2over4`, `3over4`, `3over8`, `4over4`, `6over8`, `9over8`,
-  `12over8`;
 - **barline**: `barlineSingle`.
 
 ```bash
@@ -340,6 +337,9 @@ uv run musicset symbols data/symbols -n 300 --from-dataset data/piano
 
 # Add the HOMUS pen-stroke dataset (15,200 symbols, 100 writers; writers never straddle splits)
 uv run musicset symbols data/symbols -n 300 --homus ~/data/HOMUS.zip --homus-copies 2
+
+# Add real handwritten digits and letters (EMNIST byclass) for the fingerings and dynamics
+uv run musicset symbols data/symbols -n 300 --emnist ~/data/emnist --emnist-per-class 1000
 ```
 
 Writes both `dataset.npz` (`x_train`, `y_train`, `s_train`, `x_val`, ...,
@@ -349,11 +349,20 @@ Writes both `dataset.npz` (`x_train`, `y_train`, `s_train`, `x_val`, ...,
 records the build settings and per-split counts.
 
 `s_<split>` holds each sample's source (`0` font glyph, `1` stylus stroke
-template, `2` score crop, `3` real pen strokes from HOMUS or an editor), so a
-classifier can report stylus and real-crop accuracy separately; `w_<split>` the
-writer id of pen samples (`-1` otherwise). HOMUS val/test samples are rendered
-once, deterministically, at their natural size, and their raw strokes are kept
-in `strokes_val.json` / `strokes_test.json` for stroke-level tests.
+template, `2` score crop, `3` real pen strokes from HOMUS or an editor, `4`
+EMNIST handwriting), so a classifier can report stylus and real-crop accuracy
+separately; `w_<split>` the writer id of pen samples (`-1` otherwise). HOMUS
+val/test samples are rendered once, deterministically, at their natural size,
+and their raw strokes are kept in `strokes_val.json` / `strokes_test.json` for
+stroke-level tests.
+
+HOMUS has no fingerings or dynamics, so `--emnist DIR` (the directory of NIST's
+`emnist-byclass-*` files, `musicset.emnist`) composes them from real handwritten
+characters: a digit `1`–`5` per fingering, the letters of `p`, `mp`, `sfz`, ...
+per dynamic, glued with a random gap and baseline jitter, then placed on the
+canvas like a stylus template. Train and val words come from EMNIST's train
+file, test words from its test file (other writers), `--emnist-per-class` words
+per class for train plus val.
 
 `c_<split>` is the **conditioning vector** (`musicset.context`): where the
 symbol sits in the score, in staff spaces, so the same pen mark can be read

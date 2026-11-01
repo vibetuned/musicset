@@ -24,29 +24,54 @@ from musicset.annotate.schema import PageAnnotation
 
 CONTEXT_FEATURES: tuple[str, ...] = (
     "valid",
+    "in_staff",
+    "above_staff",
+    "below_staff",
     "y_staff",
     "x_measure",
     "barline",
     "has_note",
+    "note_above",
+    "note_below",
+    "note_left",
+    "note_right",
     "note_dx",
     "note_dy",
     "width",
     "height",
 )
-"""Feature order of :func:`context_vector`.
+"""Feature order of :func:`context_vector`. Flags are 0 or 1, the rest roughly in [-1, 1].
+
+Where the symbol sits on the staff:
 
 * ``valid``: 1 when the context is known, else the whole vector is 0;
-* ``y_staff``: symbol centre in staff spaces from the staff's middle line,
-  positive downwards, divided by 6;
-* ``x_measure``: position inside the measure, left barline -1 to right barline 1;
-* ``barline``: distance to the nearest barline in staff spaces, divided by 8, clipped;
-* ``has_note``: 1 when a notehead (not the symbol's own) lies within 8 staff spaces;
-* ``note_dx``, ``note_dy``: symbol centre minus that notehead's centre, staff spaces / 8;
-* ``width``, ``height``: symbol size in staff spaces / 8, clipped.
+* ``in_staff`` / ``above_staff`` / ``below_staff``: one-hot of the symbol centre's
+  vertical zone, between the outer staff lines (where rests and notes live) or
+  outside them (where fingerings, dynamics and most articulations live);
+* ``y_staff``: the centre in staff spaces from the middle line, down positive, / 6;
+* ``x_measure``: position between the measure's barlines, left -1 to right 1;
+* ``barline``: distance to the nearest barline in staff spaces / 8, clipped.
+
+Where it sits relative to the nearest notehead (never the symbol's own):
+
+* ``has_note``: 1 when one lies within ``NOTE_RANGE`` staff spaces;
+* ``note_above`` / ``note_below``: the symbol is in the note's column, above or
+  below it (staccato, tenuto, accent, fingering);
+* ``note_left`` / ``note_right``: the symbol is beside the note (accidental on the
+  left, augmentation dot on the right);
+* ``note_dx``, ``note_dy``: the exact offset, symbol centre minus note centre, / 8;
+
+and its size: ``width``, ``height`` in staff spaces / 8, clipped.
 """
 CONTEXT_DIM = len(CONTEXT_FEATURES)
 NOTE_RANGE = 8.0
 """Staff spaces within which a notehead counts as the symbol's neighbour."""
+STAFF_HALF_HEIGHT = 2.0
+"""Staff spaces from the middle line to the outer lines: the ``in_staff`` zone."""
+NOTE_SIDE = 0.5
+"""Offset in staff spaces beyond which the symbol counts as beside, above or below the note."""
+NOTE_COLUMN = 1.0
+"""Horizontal offset within which the symbol counts as in the note's column."""
 NOTEHEAD_CODES = frozenset({"E0A0", "E0A1", "E0A2", "E0A3", "E0A4", "E0A5", "E0A9", "E0B3"})
 
 
@@ -71,13 +96,21 @@ def context_vector(ctx: SymbolContext | None) -> np.ndarray:
     has_note = ctx.note_dx is not None and ctx.note_dy is not None
     dx = ctx.note_dx if ctx.note_dx is not None else 0.0
     dy = ctx.note_dy if ctx.note_dy is not None else 0.0
+    in_column = has_note and abs(dx) < NOTE_COLUMN
     return np.array(
         [
             1.0,
+            1.0 if abs(ctx.y_staff) <= STAFF_HALF_HEIGHT else 0.0,
+            1.0 if ctx.y_staff < -STAFF_HALF_HEIGHT else 0.0,
+            1.0 if ctx.y_staff > STAFF_HALF_HEIGHT else 0.0,
             max(-2.0, min(2.0, ctx.y_staff / 6.0)),
             max(-1.0, min(1.0, ctx.x_measure * 2.0 - 1.0)),
             max(0.0, min(1.0, ctx.barline / 8.0)),
             1.0 if has_note else 0.0,
+            1.0 if in_column and dy <= -NOTE_SIDE else 0.0,
+            1.0 if in_column and dy >= NOTE_SIDE else 0.0,
+            1.0 if has_note and dx <= -NOTE_SIDE else 0.0,
+            1.0 if has_note and dx >= NOTE_SIDE else 0.0,
             max(-1.0, min(1.0, dx / NOTE_RANGE)),
             max(-1.0, min(1.0, dy / NOTE_RANGE)),
             max(0.0, min(1.5, ctx.width / 8.0)),
@@ -205,7 +238,10 @@ def page_symbol_contexts(
 __all__ = [
     "CONTEXT_DIM",
     "CONTEXT_FEATURES",
+    "NOTE_COLUMN",
     "NOTE_RANGE",
+    "NOTE_SIDE",
+    "STAFF_HALF_HEIGHT",
     "PageGeometry",
     "SymbolContext",
     "context_from_record",

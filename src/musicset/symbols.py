@@ -58,6 +58,7 @@ from musicset.context import (
     SymbolContext,
     context_vector,
 )
+from musicset.emnist import EMNIST_SYMBOLS, compose_word, load_emnist
 from musicset.homus import Stroke, StrokeSample, load_homus, stroke_fraction
 from musicset.parallel import map_pool
 from musicset.pipeline import PAGE_SUFFIX, page_file_stem
@@ -73,7 +74,6 @@ SYMBOL_GROUPS = (
     "note",
     "rest",
     "clef",
-    "timesig",
     "barline",
 )
 PRESETS = ("mixed", "tablet", "score", "clean")
@@ -83,10 +83,11 @@ EDITOR_PEN_WIDTH = 0.05
 the width the score editor sends (``granita.DEFAULT_PEN_WIDTH``; it scored best on
 held-out writers). Training renders span 0.05-0.13."""
 
-SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP, SOURCE_HAND = 0, 1, 2, 3
-SOURCE_NAMES = ("font", "stroke", "crop", "hand")
+SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP, SOURCE_HAND, SOURCE_EMNIST = 0, 1, 2, 3, 4
+SOURCE_NAMES = ("font", "stroke", "crop", "hand", "emnist")
 """Per-sample provenance, stored as ``s_<split>`` in ``dataset.npz``: SMuFL glyph
-render, stylus stroke template, score crop, real pen strokes (HOMUS)."""
+render, stylus stroke template, score crop, real pen strokes (HOMUS or an editor),
+real handwritten digits and letters (EMNIST) for fingerings and dynamics."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,17 +279,6 @@ SYMBOLS: tuple[SymbolSpec, ...] = (
     SymbolSpec("gClef", "clef", ("E050",), scale_range=(0.70, 0.90)),
     SymbolSpec("fClef", "clef", ("E062",), scale_range=(0.52, 0.78)),
     SymbolSpec("cClef", "clef", ("E05C",), scale_range=(0.58, 0.84)),
-    # Time signatures: the single glyphs, then digit stacks composed at render time
-    SymbolSpec("timeSigCommon", "timesig", ("E08A",), scale_range=(0.36, 0.60)),
-    SymbolSpec("timeSigCutCommon", "timesig", ("E08B",), scale_range=(0.50, 0.78)),
-    SymbolSpec("timeSig2over2", "timesig", (), scale_range=(0.60, 0.86), compose=("2", "2")),
-    SymbolSpec("timeSig2over4", "timesig", (), scale_range=(0.60, 0.86), compose=("2", "4")),
-    SymbolSpec("timeSig3over4", "timesig", (), scale_range=(0.60, 0.86), compose=("3", "4")),
-    SymbolSpec("timeSig3over8", "timesig", (), scale_range=(0.60, 0.86), compose=("3", "8")),
-    SymbolSpec("timeSig4over4", "timesig", (), scale_range=(0.60, 0.86), compose=("4", "4")),
-    SymbolSpec("timeSig6over8", "timesig", (), scale_range=(0.60, 0.86), compose=("6", "8")),
-    SymbolSpec("timeSig9over8", "timesig", (), scale_range=(0.60, 0.86), compose=("9", "8")),
-    SymbolSpec("timeSig12over8", "timesig", (), scale_range=(0.62, 0.88), compose=("12", "8")),
     # Barline: drawn as a bar, Verovio engraves it as a line rather than a glyph
     SymbolSpec("barlineSingle", "barline", (), scale_range=(0.58, 0.86)),
 )
@@ -973,6 +963,63 @@ def render_symbol(
         symbol, size=size, preset=preset, strength=strength, invert=invert, rng=rng
     )
     return image
+
+
+def render_ink_sample(
+    ink: np.ndarray,
+    *,
+    size: int = 32,
+    fraction: float = 0.7,
+    preset: str = "clean",
+    strength: float = 1.0,
+    invert: bool = False,
+    rng: np.random.Generator | int | None = None,
+) -> np.ndarray:
+    """Put a black-on-white ink image (a handwritten glyph or word) on the symbol canvas
+    like a stylus template: centred, aspect kept, its longer side spanning ``fraction``
+    of the canvas; presets other than ``clean`` add the tablet/scan augmentations."""
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}: {PRESETS}")
+    gen = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+    canvas = max(96, size * 3)
+    h, w = ink.shape
+    scale = canvas * fraction / max(1, h, w)
+    tw, th = max(1, round(w * scale)), max(1, round(h * scale))
+    glyph = Image.fromarray(ink, mode="L").resize((tw, th), Image.Resampling.BILINEAR)
+    page = Image.new("L", (canvas, canvas), 255)
+    shift = canvas * 0.06 if preset != "clean" else 0.0
+    x = round((canvas - tw) / 2 + (gen.uniform(-shift, shift) if shift else 0.0))
+    y = round((canvas - th) / 2 + (gen.uniform(-shift, shift) if shift else 0.0))
+    page.paste(glyph, (x, y))
+    raw = np.asarray(page, dtype=np.float32) / 255.0
+    augmented = _augment_symbol(raw, preset=preset, strength=strength, rng=gen)
+    pil = Image.fromarray((np.clip(augmented, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode="L")
+    resized = np.asarray(pil.resize((size, size), Image.Resampling.BILINEAR), dtype=np.uint8)
+    return (255 - resized) if invert else resized
+
+
+EmnistTask = tuple[tuple[np.ndarray, ...], float, float, int, float, bool, int, int, bool]
+
+
+def _render_emnist_task(task: EmnistTask) -> np.ndarray:
+    """One EMNIST sample: the word's glyphs composed, then placed like a stylus template
+    (augmented at a jittered size for ``train``, clean otherwise)."""
+    glyphs, lo, hi, size, strength, invert, seed, j, train = task
+    rng = np.random.default_rng([seed, 5, j])
+    word = compose_word(glyphs, rng)
+    if train:
+        return render_ink_sample(
+            word,
+            size=size,
+            fraction=float(rng.uniform(lo, hi)),
+            preset="tablet",
+            strength=strength,
+            invert=invert,
+            rng=rng,
+        )
+    return render_ink_sample(
+        word, size=size, fraction=0.5 * (lo + hi), preset="clean", invert=invert, rng=rng
+    )
 
 
 def _run_tasks[A, T](
@@ -1701,6 +1748,8 @@ def build_symbol_dataset(
     max_crops_per_class: int = 0,
     homus: Path | None = None,
     strokes: Sequence[Path] = (),
+    emnist: Path | None = None,
+    emnist_per_class: int = 1000,
     homus_copies: int = 1,
     homus_brush: float = 0.0,
     context_p: float = 0.7,
@@ -1742,6 +1791,10 @@ def build_symbol_dataset(
     * ``out/dataset.npz`` (``x_<split>``, ``y_<split>``, ``s_<split>`` source
       codes indexing ``SOURCE_NAMES``, ``w_<split>`` writer ids (``-1`` for
       synthetic and crops), ``c_<split>`` context vectors, ``classes``);
+
+    ``emnist`` (the directory of NIST's ``byclass`` files) adds ``emnist_per_class``
+    real handwritten words per fingering and dynamic class (:mod:`musicset.emnist`),
+    train and val from EMNIST's train file, test from its test file.
     * ``out/labels.json`` (class list, index map, group map, build settings,
       per-class, per-split and per-source counts, removed samples);
     * ``out/strokes_<split>.json`` for HOMUS val/test samples;
@@ -1749,8 +1802,8 @@ def build_symbol_dataset(
     """
     if samples_per_class < 0:
         raise ValueError("samples_per_class must be >= 0")
-    if samples_per_class == 0 and not from_dataset and homus is None and not strokes:
-        raise ValueError("need samples_per_class > 0, from_dataset, homus or strokes")
+    if samples_per_class == 0 and not from_dataset and homus is None and not strokes and not emnist:
+        raise ValueError("need samples_per_class > 0, from_dataset, homus, strokes or emnist")
 
     specs = symbol_specs(groups)
     class_names = tuple(s.name for s in specs)
@@ -1818,6 +1871,66 @@ def build_symbol_dataset(
             for name, i in idx.items():
                 pieces[name].append(
                     (cx[i], cy[i], cs[i], no_writer(len(i)), cc[i], np.zeros(len(i), bool))
+                )
+
+    if emnist is not None and emnist_per_class > 0:
+        r_train, r_val, r_test = _normalized_ratios(split)
+        emnist_classes = [n for n in class_names if n in EMNIST_SYMBOLS]
+        chars = "".join(sorted({c for n in emnist_classes for w in EMNIST_SYMBOLS[n] for c in w}))
+        glyph_pools: dict[str, dict[str, np.ndarray]] = {}
+        for file_split in ("train", "test"):
+            xs, cs = load_emnist(emnist, file_split, chars=chars)
+            glyph_pools[file_split] = {c: xs[cs == c] for c in chars}
+        n_test = round(emnist_per_class * r_test / max(1e-9, r_train + r_val))
+        for name, file_split, n_words in (
+            ("train", "train", emnist_per_class),
+            ("test", "test", n_test),
+        ):
+            em_tasks: list[EmnistTask] = []
+            em_labels: list[int] = []
+            for cls_name in emnist_classes:
+                spec = SYMBOL_BY_NAME[cls_name]
+                words = EMNIST_SYMBOLS[cls_name]
+                pool = glyph_pools[file_split]
+                for k in range(n_words):
+                    j = class_to_idx[cls_name] * 1_000_000 + k + (500_000 if name == "test" else 0)
+                    word = words[int(rng.integers(len(words)))]
+                    glyphs = tuple(pool[c][int(rng.integers(len(pool[c])))] for c in word)
+                    lo, hi = spec.scale_range
+                    em_tasks.append(
+                        (glyphs, lo, hi, size, strength, invert, seed, j, name == "train")
+                    )
+                    em_labels.append(class_to_idx[cls_name])
+            if not em_tasks:
+                continue
+            em_x = np.empty((len(em_tasks), size, size), dtype=np.uint8)
+            for n, image in enumerate(_run_tasks(_render_emnist_task, em_tasks, workers, 64)):
+                em_x[n] = image
+            em_y = np.array(em_labels, dtype=np.int64)
+            em_mask = inked_mask(em_x)
+            em_x, em_y = em_x[em_mask], em_y[em_mask]
+            em_s = np.full(len(em_y), SOURCE_EMNIST, dtype=np.uint8)
+            if name == "train":
+                # EMNIST's train file feeds train and val; its test file (other writers) feeds test
+                for part, idx in _stratified_split_indices(
+                    em_y, (r_train, r_val, 0.0), rng
+                ).items():
+                    if len(idx):
+                        n_ = len(idx)
+                        pieces[part].append(
+                            (
+                                em_x[idx],
+                                em_y[idx],
+                                em_s[idx],
+                                no_writer(n_),
+                                unknown_context(n_),
+                                np.ones(n_, bool),
+                            )
+                        )
+            else:
+                n_ = len(em_y)
+                pieces["test"].append(
+                    (em_x, em_y, em_s, no_writer(n_), unknown_context(n_), np.ones(n_, bool))
                 )
 
     hand: list[StrokeSample] = []
@@ -2018,6 +2131,8 @@ def build_symbol_dataset(
         "from_dataset": [str(p) for p in roots],
         "max_crops_per_class": max_crops_per_class,
         "homus": None if homus is None else str(homus),
+        "emnist": None if emnist is None else str(emnist),
+        "emnist_per_class": emnist_per_class,
         "strokes": [str(p) for p in strokes],
         "homus_copies": homus_copies,
         "homus_brush": homus_brush,
@@ -2077,6 +2192,7 @@ __all__ = [
     "EDITOR_PEN_WIDTH",
     "PRESETS",
     "SOURCE_CROP",
+    "SOURCE_EMNIST",
     "SOURCE_FONT",
     "SOURCE_HAND",
     "SOURCE_NAMES",
@@ -2096,6 +2212,7 @@ __all__ = [
     "load_symbol_sources",
     "normalize_strokes",
     "page_symbol_boxes",
+    "render_ink_sample",
     "render_strokes_sample",
     "render_symbol",
     "render_symbol_with_source",

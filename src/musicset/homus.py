@@ -25,18 +25,8 @@ Point = tuple[float, float]
 Stroke = tuple[Point, ...]
 
 HOMUS_CLASSES: dict[str, str] = {
-    "12-8-Time": "timeSig12over8",
-    "2-2-Time": "timeSig2over2",
-    "2-4-Time": "timeSig2over4",
-    "3-4-Time": "timeSig3over4",
-    "3-8-Time": "timeSig3over8",
-    "4-4-Time": "timeSig4over4",
-    "6-8-Time": "timeSig6over8",
-    "9-8-Time": "timeSig9over8",
     "Barline": "barlineSingle",
     "C-Clef": "cClef",
-    "Common-Time": "timeSigCommon",
-    "Cut-Time": "timeSigCutCommon",
     "Dot": "augmentationDot",
     "Double-Sharp": "accidentalDoubleSharp",
     "Eighth-Note": "note8th",
@@ -58,7 +48,8 @@ HOMUS_CLASSES: dict[str, str] = {
     "Whole-Half-Rest": "restWholeHalf",
     "Whole-Note": "noteWhole",
 }
-"""HOMUS class name -> ``musicset`` symbol class."""
+"""HOMUS class name -> ``musicset`` symbol class. HOMUS's ten time-signature classes are
+left out on purpose: stacked digits hurt every other class (fingerings above all)."""
 
 HOMUS_CANVAS = 150.0
 """Pen units that fill the symbol canvas: a G clef (~127 units) spans ~85% of it."""

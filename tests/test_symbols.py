@@ -7,6 +7,7 @@ from PIL import Image
 
 from musicset.annotate.schema import Element, Glyph, PageAnnotation
 from musicset.cli import main
+from musicset.context import CONTEXT_DIM
 from musicset.pipeline import PAGE_SUFFIX
 from musicset.symbols import (
     PRESETS,
@@ -28,7 +29,7 @@ from musicset.symbols import (
 
 def test_symbol_catalog_covers_fingerings_1_to_5_and_all_groups():
     names = [s.name for s in SYMBOLS]
-    assert len(names) == len(set(names)) == 61
+    assert len(names) == len(set(names)) == 51
     assert (
         names[:33] == [s.name for s in SYMBOLS[:33]] and names[32] == "pedal"
     )  # old indices stable
@@ -175,7 +176,6 @@ def test_page_symbol_extraction_notes_and_timesigs_with_context():
     )
     items = page_symbol_boxes_with_context(page, (1000, 400))
     assert [(cls, box) for cls, box, _ in items] == [
-        ("timeSig12over8", (40.0, 100.0, 90.0, 180.0)),
         ("noteQuarter", (150.0, 80.0, 172.0, 150.0)),  # notehead+stem only, excludes artic
         ("note8th", (240.0, 80.0, 275.0, 150.0)),  # notehead+stem+flag
         ("articStaccatoAbove", (155.0, 180.0, 168.0, 200.0)),
@@ -352,19 +352,26 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
     )
     assert report.removed == {"blank": 4, "duplicate": 3}
     assert sum(report.splits.values()) == 1
-    assert report.source_counts["test"] == {"font": 0, "stroke": 0, "crop": 1, "hand": 0}
+    assert report.source_counts["test"] == {
+        "font": 0,
+        "stroke": 0,
+        "crop": 1,
+        "hand": 0,
+        "emnist": 0,
+    }
     with np.load(out / "dataset.npz") as data:
         for split in ("train", "val", "test"):
             assert data[f"s_{split}"].shape == data[f"y_{split}"].shape
             assert (data[f"w_{split}"] == -1).all()
-            assert data[f"c_{split}"].shape == (len(data[f"y_{split}"]), 9)
+            assert data[f"c_{split}"].shape == (len(data[f"y_{split}"]), CONTEXT_DIM)
             assert set(data[f"s_{split}"].tolist()) <= {SOURCE_CROP}
         # the surviving crop has a real context: centre 4.5 spaces above the middle line
         c = data["c_test"]
-        assert c.shape[0] == 1 and c[0, 0] == 1.0 and abs(c[0, 1] - (-4.5 / 6)) < 1e-6
+        assert c.shape[0] == 1 and c[0, 0] == 1.0 and c[0, 2] == 1.0  # above the staff
+        assert abs(c[0, 4] - (-4.5 / 6)) < 1e-6
     assert load_symbol_sources(out, "test").tolist() == [SOURCE_CROP]
     meta = json.loads((out / "labels.json").read_text())
-    assert meta["source_names"] == ["font", "stroke", "crop", "hand"]
+    assert meta["source_names"] == ["font", "stroke", "crop", "hand", "emnist"]
     assert meta["removed"] == {"blank": 4, "duplicate": 3}
     assert meta["from_dataset"] == [str(ds)]
     assert meta["crop_scores"] == {"train": 2, "val": 1, "test": 1}
@@ -382,12 +389,7 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
     assert kept.removed == {"blank": 0, "duplicate": 0} and sum(kept.splits.values()) == 4
 
 
-def test_composite_time_signature_and_barline_render_ink():
-    stacked = render_symbol("timeSig12over8", size=32, preset="clean", rng=0)
-    single = render_symbol("timeSigCommon", size=32, preset="clean", rng=0)
-    assert (stacked < 128).sum() > (single < 128).sum() > 10
-    rows = (stacked < 128).any(axis=1).nonzero()[0]
-    assert rows.max() - rows.min() >= 16  # two stacked rows fill most of the height
+def test_barline_renders_as_a_bar():
     bar = render_symbol("barlineSingle", size=32, preset="clean", rng=1)
     cols = (bar < 128).any(axis=0).nonzero()[0]
     rows = (bar < 128).any(axis=1).nonzero()[0]
@@ -400,7 +402,7 @@ def test_homus_reader_rendering_and_writer_split(tmp_path: Path):
     from musicset.homus import HOMUS_CLASSES, load_homus, parse_homus, stroke_fraction
     from musicset.symbols import SOURCE_HAND, render_strokes_sample
 
-    assert len(HOMUS_CLASSES) == 32 and set(HOMUS_CLASSES.values()) <= set(SYMBOL_BY_NAME)
+    assert len(HOMUS_CLASSES) == 22 and set(HOMUS_CLASSES.values()) <= set(SYMBOL_BY_NAME)
     label, strokes = parse_homus("G-Clef\n10,10;12,40;14,90;\n\n30,20;40,20;\n")
     assert label == "G-Clef" and strokes == (
         ((10.0, 10.0), (12.0, 40.0), (14.0, 90.0)),
@@ -451,10 +453,16 @@ def test_homus_reader_rendering_and_writer_split(tmp_path: Path):
         write_png=False,
     )
     assert report.splits == {"train": 4, "val": 2, "test": 2}  # train writer rendered twice
-    assert report.source_counts["test"] == {"font": 0, "stroke": 0, "crop": 0, "hand": 2}
+    assert report.source_counts["test"] == {
+        "font": 0,
+        "stroke": 0,
+        "crop": 0,
+        "hand": 2,
+        "emnist": 0,
+    }
     meta = json.loads((out / "labels.json").read_text())
     assert meta["homus_writers"] == {"train": 1, "val": 1, "test": 1}
-    assert meta["source_names"] == ["font", "stroke", "crop", "hand"]
+    assert meta["source_names"] == ["font", "stroke", "crop", "hand", "emnist"]
     with np.load(out / "dataset.npz") as data:
         assert set(data["s_test"].tolist()) == {SOURCE_HAND}
         assert set(data["w_test"].tolist()) <= {1, 2, 3} and len(set(data["w_train"].tolist())) == 1
@@ -497,13 +505,20 @@ def test_context_vector_and_page_geometry():
     assert abs(ctx.width - 0.5) < 1e-9 and abs(ctx.height - 0.5) < 1e-9
     v = context_vector(ctx)
     assert v.shape == (CONTEXT_DIM,) and v.dtype == np.float32
-    assert abs(v[0] - 1.0) < 1e-6 and abs(v[1] - (-1.75 / 6)) < 1e-6
-    assert abs(v[2] - 0.34) < 1e-6 and abs(v[3] - 1.0) < 1e-6  # barline clipped at 8
-    assert v[4] == 1.0 and abs(v[5] - 1.25 / 8) < 1e-6 and abs(v[6] - (-1.75 / 8)) < 1e-6
+    assert v[0] == 1.0 and v[1] == 1.0 and v[2] == 0.0 and v[3] == 0.0  # inside the staff lines
+    assert abs(v[4] - (-1.75 / 6)) < 1e-6
+    assert abs(v[5] - 0.34) < 1e-6 and abs(v[6] - 1.0) < 1e-6  # barline clipped at 8
+    # the note is 1.25 spaces to the left: beside it, not in its column
+    assert v[7] == 1.0 and (v[8], v[9], v[10], v[11]) == (0.0, 0.0, 0.0, 1.0)
+    assert abs(v[12] - 1.25 / 8) < 1e-6 and abs(v[13] - (-1.75 / 8)) < 1e-6
+    # a staccato-like mark straight above the notehead, outside the staff
+    above = context_vector(SymbolContext(-3.0, 0.5, 4.0, 0.2, -2.5, 0.4, 0.4))
+    assert (above[1], above[2], above[3]) == (0.0, 1.0, 0.0)
+    assert (above[8], above[9], above[10], above[11]) == (1.0, 0.0, 0.0, 0.0)
     # far from any notehead and outside every measure
     far = geo.context((800, 300, 820, 320))
     assert far is not None and far.note_dx is None and far.x_measure == 0.5
-    assert context_vector(far)[4] == 0.0
+    assert context_vector(far)[7] == 0.0 and context_vector(far)[3] == 1.0  # below the staff
     # a box whose own notehead must not count as its neighbour
     own = geo.context((300, 130, 320, 150))
     assert own is not None and own.note_dx is None
@@ -584,7 +599,114 @@ def test_stroke_contributions_with_context(tmp_path: Path):
         c = np.concatenate([data["c_train"], data["c_test"]])
         w = np.concatenate([data["w_train"], data["w_test"]])
         assert set(w.tolist()) == {1000, 1001}
-        assert c[w == 1000][0, 0] == 1.0 and c[w == 1000][0, 4] == 1.0  # alice's real context
+        assert c[w == 1000][0, 0] == 1.0 and c[w == 1000][0, 7] == 1.0  # alice's real context
         assert (c[w == 1001] == 0).all()  # bob's unknown (no crop pool to draw from)
     meta = json.loads((out / "labels.json").read_text())
     assert meta["context_features"][0] == "valid" and meta["strokes"] == [str(f)]
+
+
+def _write_idx(path: Path, array: np.ndarray) -> None:
+    import gzip
+    import struct
+
+    code = {np.uint8: 8}[array.dtype.type]
+    header = (
+        b"\x00\x00" + bytes([code, array.ndim]) + struct.pack(">" + "I" * array.ndim, *array.shape)
+    )
+    with gzip.open(path, "wb") as f:
+        f.write(header + array.tobytes())
+
+
+def test_emnist_reader_and_word_composition(tmp_path: Path):
+    from musicset.emnist import (
+        BYCLASS_CHARS,
+        EMNIST_SYMBOLS,
+        compose_word,
+        ink_bbox,
+        load_emnist,
+        read_idx,
+    )
+    from musicset.symbols import SYMBOL_BY_NAME
+
+    assert set(EMNIST_SYMBOLS) <= set(SYMBOL_BY_NAME)
+    assert all(c in BYCLASS_CHARS for words in EMNIST_SYMBOLS.values() for w in words for c in w)
+
+    # two fake EMNIST samples: a "1" and a "p", stored transposed and white-on-black
+    one = np.zeros((28, 28), dtype=np.uint8)
+    one[4:24, 13:16] = 255  # a vertical bar, upright
+    pee = np.zeros((28, 28), dtype=np.uint8)
+    pee[6:26, 8:11] = 255  # stem
+    pee[6:16, 8:20] = 255  # bowl
+    images = np.stack([one.T, pee.T])  # EMNIST layout
+    labels = np.array([BYCLASS_CHARS.index("1"), BYCLASS_CHARS.index("p")], dtype=np.uint8)
+    _write_idx(tmp_path / "emnist-byclass-train-images-idx3-ubyte.gz", images)
+    _write_idx(tmp_path / "emnist-byclass-train-labels-idx1-ubyte.gz", labels)
+    (tmp_path / "emnist-byclass-mapping.txt").write_text(
+        "\n".join(f"{i} {ord(c)}" for i, c in enumerate(BYCLASS_CHARS))
+    )
+    assert (
+        read_idx(tmp_path / "emnist-byclass-train-labels-idx1-ubyte.gz").tolist() == labels.tolist()
+    )
+
+    xs, chars = load_emnist(tmp_path, "train")
+    assert xs.shape == (2, 28, 28) and xs.dtype == np.uint8 and chars.tolist() == ["1", "p"]
+    assert np.array_equal(xs[0], 255 - one)  # upright again, black ink on white paper
+    assert ink_bbox(xs[0]) == (13, 4, 16, 24)
+    only_p, only_chars = load_emnist(tmp_path, "train", chars="p")
+    assert only_chars.tolist() == ["p"] and len(only_p) == 1
+
+    word = compose_word([xs[1], xs[1]], np.random.default_rng(0), gap=(0.1, 0.1), jitter=0.0)
+    assert word.ndim == 2 and word.dtype == np.uint8 and int(word[0, 0]) in (0, 255)
+    assert word.shape[0] == 20 and word.shape[1] >= 2 * 12 + 2  # two 12-wide p's plus a gap
+    with pytest.raises(ValueError, match="unknown EMNIST split"):
+        load_emnist(tmp_path, "valid")
+    with pytest.raises(ValueError, match="at least one inked"):
+        compose_word([np.full((28, 28), 255, dtype=np.uint8)], np.random.default_rng(0))
+
+
+def test_build_dataset_with_emnist(tmp_path: Path):
+    from musicset.emnist import BYCLASS_CHARS
+    from musicset.symbols import SOURCE_EMNIST, render_ink_sample
+
+    root = tmp_path / "emnist"
+    root.mkdir()
+
+    def glyph(char: str) -> np.ndarray:  # a distinct blob per character, EMNIST layout
+        img = np.zeros((28, 28), dtype=np.uint8)
+        k = BYCLASS_CHARS.index(char) % 10
+        img[4 + k % 3 : 24, 6 + k % 4 : 10 + k % 4 + 8] = 255
+        return img.T
+
+    for split in ("train", "test"):
+        chars = list("12345pmfsz") * 6
+        _write_idx(
+            root / f"emnist-byclass-{split}-images-idx3-ubyte.gz",
+            np.stack([glyph(c) for c in chars]),
+        )
+        _write_idx(
+            root / f"emnist-byclass-{split}-labels-idx1-ubyte.gz",
+            np.array([BYCLASS_CHARS.index(c) for c in chars], dtype=np.uint8),
+        )
+    ink = render_ink_sample(255 - glyph("p").T, size=32, fraction=0.6)
+    assert ink.shape == (32, 32) and (ink < 128).sum() > 20 and int(ink[0, 0]) == 255
+
+    out = tmp_path / "out"
+    report = build_symbol_dataset(
+        out,
+        samples_per_class=0,
+        emnist=root,
+        emnist_per_class=6,
+        groups=("fingering", "dynamic"),
+        split=(0.5, 0.25, 0.25),
+        min_ink=1,
+        write_png=False,
+    )
+    counts = report.source_counts
+    assert counts["train"]["emnist"] > 0 and counts["val"]["emnist"] > 0
+    assert counts["test"]["emnist"] > 0
+    assert sum(counts[s]["emnist"] for s in counts) == sum(report.splits.values())
+    with np.load(out / "dataset.npz") as data:
+        assert set(data["s_train"].tolist()) == {SOURCE_EMNIST}
+        assert data["y_train"].max() <= 16  # 5 fingerings + 12 dynamics
+    meta = json.loads((out / "labels.json").read_text())
+    assert meta["emnist"] == str(root) and meta["source_names"][-1] == "emnist"
