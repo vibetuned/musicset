@@ -185,7 +185,8 @@ def test_kern_tab_engraves_ground_truth_and_prediction(dataset: Path, tmp_path: 
 
     deadline = time.monotonic() + 120
     engraved = lambda key: any(  # noqa: E731
-        i.type() == 7 for i in kern.columns[key].scene.items()  # QGraphicsPixmapItem
+        i.type() == 7
+        for i in kern.columns[key].scene.items()  # QGraphicsPixmapItem
     )
     while not (engraved("gt") and engraved("pred")) and time.monotonic() < deadline:
         app.processEvents()

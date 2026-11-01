@@ -131,6 +131,58 @@ def test_page_symbol_extraction_splits_fingerings_and_skips_key_sig():
     assert (crops[0][1] < 200).any()
 
 
+def test_page_symbol_extraction_notes_and_timesigs_with_context():
+    from musicset.symbols import page_symbol_boxes_with_context
+
+    page = PageAnnotation(
+        score="s",
+        page=1,
+        width=1000.0,
+        height=400.0,
+        pixel_width=1000.0,
+        pixel_height=400.0,
+        elements=[
+            Element("sys", ("system-staff",), (0, 100, 1000, 180), synthetic=True),
+            Element("m", ("measure",), (0, 80, 1000, 220)),
+            # 12/8 stacked time signature (element 2)
+            Element("ts", ("meterSig",), (40, 100, 90, 180)),
+            # Standalone quarter note with an attached staccato (elements 3..6)
+            Element("nq", ("note",), (150, 80, 175, 200), attrs={"dur": "4"}),
+            Element(None, ("notehead",), (150, 130, 172, 150), parent=3),
+            Element("st1", ("stem",), (168, 80, 172, 140), parent=3),
+            Element("ar1", ("artic",), (155, 180, 168, 200), parent=3),
+            # Standalone 8th note inferred from flag glyph without data-dur (elements 7..10)
+            Element("n8", ("note",), (240, 80, 275, 150)),
+            Element(None, ("notehead",), (240, 130, 262, 150), parent=7),
+            Element("st2", ("stem",), (258, 80, 262, 140), parent=7),
+            Element("fl2", ("flag",), (258, 80, 275, 120), parent=9),
+            # Beamed note: must NOT be emitted as an isolated note (elements 11..14)
+            Element("bm", ("beam",), (350, 80, 450, 150)),
+            Element("nb", ("note",), (350, 80, 372, 150), parent=11, attrs={"dur": "8"}),
+            Element(None, ("notehead",), (350, 130, 372, 150), parent=12),
+            Element("st3", ("stem",), (368, 80, 372, 140), parent=12),
+        ],
+        glyphs=[
+            Glyph("E081", (40, 100, 62, 138), element=2),
+            Glyph("E082", (64, 100, 90, 138), element=2),
+            Glyph("E088", (50, 142, 78, 180), element=2),
+            Glyph("E0A4", (150, 130, 172, 150), element=4, owner="nq"),
+            Glyph("E4A2", (155, 180, 168, 200), element=6, owner="ar1"),
+            Glyph("E0A4", (240, 130, 262, 150), element=8, owner="n8"),
+            Glyph("E240", (258, 80, 275, 120), element=10, owner="n8"),
+            Glyph("E0A4", (350, 130, 372, 150), element=13, owner="nb"),
+        ],
+    )
+    items = page_symbol_boxes_with_context(page, (1000, 400))
+    assert [(cls, box) for cls, box, _ in items] == [
+        ("timeSig12over8", (40.0, 100.0, 90.0, 180.0)),
+        ("noteQuarter", (150.0, 80.0, 172.0, 150.0)),  # notehead+stem only, excludes artic
+        ("note8th", (240.0, 80.0, 275.0, 150.0)),  # notehead+stem+flag
+        ("articStaccatoAbove", (155.0, 180.0, 168.0, 200.0)),
+    ]
+    assert all(ctx is not None for _, _, ctx in items)
+
+
 def test_extract_dataset_symbols_from_pages_and_annotations(tmp_path: Path):
     ds = tmp_path / "built"
     (ds / "pages").mkdir(parents=True)

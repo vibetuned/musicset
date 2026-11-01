@@ -48,8 +48,8 @@ from PIL import Image, ImageDraw, ImageFilter
 from scipy import ndimage
 from svgpathtools import parse_path
 
-from musicset.annotate.geometry import BBox
-from musicset.annotate.schema import PageAnnotation
+from musicset.annotate.geometry import BBox, union
+from musicset.annotate.schema import Element, Glyph, PageAnnotation
 from musicset.annotate.smufl import available_fonts, verovio_data_dir
 from musicset.context import (
     CONTEXT_DIM,
@@ -77,6 +77,11 @@ SYMBOL_GROUPS = (
     "barline",
 )
 PRESETS = ("mixed", "tablet", "score", "clean")
+
+EDITOR_PEN_WIDTH = 0.05
+"""Pen width, as a fraction of the canvas, that val/test pen samples are rendered with:
+the width the score editor sends (``granita.DEFAULT_PEN_WIDTH``; it scored best on
+held-out writers). Training renders span 0.05-0.13."""
 
 SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP, SOURCE_HAND = 0, 1, 2, 3
 SOURCE_NAMES = ("font", "stroke", "crop", "hand")
@@ -293,12 +298,41 @@ SYMBOL_BY_NAME: dict[str, SymbolSpec] = {s.name: s for s in SYMBOLS}
 # Element classes in PageAnnotation that map directly to a symbol class
 _ELEMENT_SYMBOLS = frozenset(("trill", "mordent", "turn", "fermata", "arpeg", "pedal"))
 
+# Stacked time signatures by (numerator, denominator)
+_TIMESIG_BY_COMPOSE: dict[tuple[str, str], str] = {
+    spec.compose: spec.name for spec in SYMBOLS if spec.compose is not None
+}
+
+# Standalone note durations (MEI @dur -> symbol class)
+_NOTE_BY_DUR: dict[str, str] = {
+    "1": "noteWhole",
+    "2": "noteHalf",
+    "4": "noteQuarter",
+    "8": "note8th",
+    "16": "note16th",
+    "32": "note32nd",
+    "64": "note64th",
+}
+_NOTE_BODY_CLASSES = frozenset(("notehead", "stem", "flag"))
+_SKIP_NOTE_ANCESTORS = frozenset(("beam", "chord", "graceGrp"))
+_DIGIT_CODES = frozenset(f"E08{d}" for d in range(10))
+
 # SMuFL codepoint -> symbol class for page glyph extraction
 _GLYPH_TO_SYMBOL: dict[str, str] = {
     code: spec.name
     for spec in SYMBOLS
     if spec.group
-    in ("articulation", "accidental", "dynamic", "ornament", "pedal", "note", "rest", "clef")
+    in (
+        "articulation",
+        "accidental",
+        "dynamic",
+        "ornament",
+        "pedal",
+        "note",
+        "rest",
+        "clef",
+        "timesig",
+    )
     for code in spec.codes
 }
 
@@ -735,7 +769,7 @@ def render_strokes_sample(
     *,
     size: int = 32,
     fraction: float = 0.7,
-    width: float = 0.085,
+    width: float = EDITOR_PEN_WIDTH,
     preset: str = "clean",
     strength: float = 1.0,
     invert: bool = False,
@@ -745,8 +779,8 @@ def render_strokes_sample(
     """Rasterise raw pen strokes (an editor's or HOMUS's) like a stylus template.
 
     The strokes are centred with their longer side spanning ``fraction`` of the
-    canvas and drawn with a pen ``width`` canvas widths wide (``0.085`` is the
-    middle of the template range), or a pressure-like ``brush``.
+    canvas and drawn with a pen ``width`` canvas widths wide (``EDITOR_PEN_WIDTH``
+    is what the editor sends), or a pressure-like ``brush``.
     ``preset="clean"`` is deterministic, the other presets add the tablet/scan
     augmentations and centre jitter.
     """
@@ -991,7 +1025,13 @@ def _render_hand_task(
             rng=rng,
         )
     return render_strokes_sample(
-        strokes, size=size, fraction=fraction, width=0.085, preset="clean", invert=invert, rng=rng
+        strokes,
+        size=size,
+        fraction=fraction,
+        width=EDITOR_PEN_WIDTH,
+        preset="clean",
+        invert=invert,
+        rng=rng,
     )
 
 
@@ -1139,6 +1179,54 @@ def _is_single_dot(bbox: BBox | None) -> bool:
     return w > 0 and h > 0 and max(w, h) / min(w, h) < 1.6
 
 
+def _metersig_class(el: Element, glyphs: Sequence[Glyph]) -> str | None:
+    """Symbol class of a ``meterSig`` element from its SMuFL glyphs."""
+    if el.bbox is None or not glyphs:
+        return None
+    if len(glyphs) == 1:
+        return _GLYPH_TO_SYMBOL.get(glyphs[0].code)
+    y_mid = 0.5 * (el.bbox[1] + el.bbox[3])
+    upper: list[tuple[float, str]] = []
+    lower: list[tuple[float, str]] = []
+    for g in glyphs:
+        if g.code not in _DIGIT_CODES or g.bbox is None:
+            return None
+        row = upper if 0.5 * (g.bbox[1] + g.bbox[3]) < y_mid else lower
+        row.append((g.bbox[0], g.code[-1]))
+    top = "".join(d for _, d in sorted(upper))
+    bot = "".join(d for _, d in sorted(lower))
+    return _TIMESIG_BY_COMPOSE.get((top, bot))
+
+
+def _standalone_note_class(
+    el: Element, page: PageAnnotation, parts: Sequence[int], codes: set[str]
+) -> str | None:
+    """Symbol class of an unbeamed, non-chord ``note`` element, or ``None``."""
+    if "grace" in el.classes or any(
+        _SKIP_NOTE_ANCESTORS.intersection(anc.classes) for anc in page.ancestors(el.parent)
+    ):
+        return None
+    dur = el.attrs.get("dur")
+    if dur in _NOTE_BY_DUR:
+        return _NOTE_BY_DUR[dur]
+    has_stem = any("stem" in page.elements[p].classes for p in parts)
+    if "E246" in codes or "E247" in codes:
+        return "note64th"
+    if "E244" in codes or "E245" in codes:
+        return "note32nd"
+    if "E242" in codes or "E243" in codes:
+        return "note16th"
+    if "E240" in codes or "E241" in codes:
+        return "note8th"
+    if has_stem and "E0A3" in codes:
+        return "noteHalf"
+    if has_stem and "E0A4" in codes:
+        return "noteQuarter"
+    if not has_stem and "E0A2" in codes:
+        return "noteWhole"
+    return None
+
+
 def page_symbol_boxes(
     page: PageAnnotation,
     image_size: tuple[int, int],
@@ -1170,13 +1258,52 @@ def page_symbol_boxes_with_context(
         x2, y2 = max(0.0, min(float(width), b[2] * sx)), max(0.0, min(float(height), b[3] * sy))
         return (x1, y1, x2, y2) if (x2 - x1) >= 2.0 and (y2 - y1) >= 2.0 else None
 
-    # Elements: fingerings 1-5 and structural ornaments/pedal
+    # Pre-index note body parts (notehead/stem/flag) and meterSig/note glyphs
+    note_parts: dict[int, list[int]] = {}
+    part_to_note: dict[int, int] = {}
+    metersig_children: dict[int, list[int]] = {}
+    for idx, el in enumerate(page.elements):
+        if not el.classes:
+            continue
+        cur = el.parent
+        while cur is not None:
+            anc = page.elements[cur]
+            if anc.classes and anc.classes[0] == "note" and el.classes[0] in _NOTE_BODY_CLASSES:
+                note_parts.setdefault(cur, []).append(idx)
+                part_to_note[idx] = cur
+                break
+            if anc.classes and anc.classes[0] == "meterSig":
+                metersig_children.setdefault(cur, []).append(idx)
+                break
+            cur = anc.parent
+
+    metersig_glyphs: dict[int, list[Glyph]] = {}
+    note_codes: dict[int, set[str]] = {}
+    for glyph in page.glyphs:
+        if glyph.bbox is None or glyph.element is None:
+            continue
+        el_idx: int | None = glyph.element
+        if el_idx in part_to_note:
+            note_codes.setdefault(part_to_note[el_idx], set()).add(glyph.code)
+        while el_idx is not None:
+            anc = page.elements[el_idx]
+            if anc.classes and anc.classes[0] == "meterSig":
+                metersig_glyphs.setdefault(el_idx, []).append(glyph)
+                break
+            if anc.classes and anc.classes[0] == "note" and glyph.element == el_idx:
+                note_codes.setdefault(el_idx, set()).add(glyph.code)
+                break
+            el_idx = anc.parent
+
+    # Elements: fingerings 1-5, ornaments/pedal, barlines, dots, meterSigs, standalone notes
     # Track elements covered by element boxes so we don't double-emit their glyph
     covered_elements: set[int] = set()
     for idx, el in enumerate(page.elements):
         if el.bbox is None or el.synthetic or not el.classes:
             continue
         cls: str | None = None
+        box: BBox | None = el.bbox
+        cover: list[int] = [idx]
         if "fing" in el.classes and el.text is not None:
             digit = el.text.strip()
             if digit in ("1", "2", "3", "4", "5"):
@@ -1189,11 +1316,25 @@ def page_symbol_boxes_with_context(
             # Verovio draws augmentation dots as plain circles, so there is no glyph to map;
             # a chord's dots share one tall box, which is skipped
             cls = "augmentationDot"
-        if cls is not None and (allowed is None or cls in allowed):
-            px_box = to_px(el.bbox)
+        elif el.classes[0] == "meterSig":
+            cls = _metersig_class(el, metersig_glyphs.get(idx, ()))
+            cover = [idx, *metersig_children.get(idx, ())]
+        elif el.classes[0] == "note":
+            parts = note_parts.get(idx, [])
+            cls = _standalone_note_class(el, page, parts, note_codes.get(idx, set()))
+            if cls is not None and parts:
+                body_box: BBox | None = None
+                for p in parts:
+                    body_box = union(body_box, page.elements[p].bbox)
+                if body_box is not None:
+                    box = body_box
+                # Cover only notehead/stem/flag so attached artic/accid/dots still emit
+                cover = parts
+        if cls is not None and box is not None and (allowed is None or cls in allowed):
+            px_box = to_px(box)
             if px_box is not None:
-                out.append((cls, px_box, geometry.context(el.bbox)))
-                covered_elements.add(idx)
+                out.append((cls, px_box, geometry.context(box)))
+                covered_elements.update(cover)
 
     # Glyphs: articulations, accidentals (outside key signatures), dynamics, and
     # any ornament/pedal glyph not already emitted via its enclosing element
@@ -1582,7 +1723,7 @@ def build_symbol_dataset(
     HOMUS pen strokes (``SOURCE_HAND``) split by writer: train samples are
     rendered ``homus_copies`` times with tablet augmentation at their jittered
     natural size (as a pressure brush with probability ``homus_brush``),
-    val/test samples once and deterministically, the way an
+    val/test samples once and deterministically with ``EDITOR_PEN_WIDTH``, the way an
     editor would send them, and their raw strokes are kept in
     ``strokes_val.json`` / ``strokes_test.json`` for stroke-level evaluation.
     Patches with fewer than ``min_ink`` ink pixels are dropped, and with
@@ -1742,15 +1883,39 @@ def build_symbol_dataset(
                         for j in kept
                     ]
 
-    # Contexts for samples without a real one: drawn from the training crops of their class
-    pools: dict[int, np.ndarray] = {}
-    for _, py, _, _, pc, pfill in pieces["train"]:
-        real = ~pfill & (pc[:, 0] > 0)
-        for cls_idx in np.unique(py[real]).tolist():
-            rows = pc[real & (py == cls_idx)]
-            pools[cls_idx] = np.concatenate([pools[cls_idx], rows]) if cls_idx in pools else rows
-    pools = {k: v for k, v in pools.items() if len(v) >= 10}
-    for parts in pieces.values():
+    # Contexts for samples without a real one: drawn from the real crops of their class
+    # (with family fallback for rare note durations / meters, and split-local pools when >= 10)
+    stemmed_idxs = [
+        class_to_idx[c]
+        for c in ("noteHalf", "noteQuarter", "note8th", "note16th", "note32nd", "note64th")
+        if c in class_to_idx
+    ]
+    timesig_idxs = [i for i, s in enumerate(specs) if s.group == "timesig"]
+
+    def build_pools(
+        split_pieces: list[
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ],
+    ) -> dict[int, np.ndarray]:
+        raw: dict[int, np.ndarray] = {}
+        for _, py, _, _, pc, pfill in split_pieces:
+            real = ~pfill & (pc[:, 0] > 0)
+            for cls_idx in np.unique(py[real]).tolist():
+                rows = pc[real & (py == cls_idx)]
+                raw[cls_idx] = np.concatenate([raw[cls_idx], rows]) if cls_idx in raw else rows
+        out = {k: v for k, v in raw.items() if len(v) >= 10}
+        for family in (stemmed_idxs, timesig_idxs):
+            family_rows = [raw[i] for i in family if i in raw]
+            if family_rows:
+                merged = np.concatenate(family_rows)
+                if len(merged) >= 10:
+                    for i in family:
+                        out.setdefault(i, merged)
+        return out
+
+    pools = build_pools(pieces["train"])
+    for name, parts in pieces.items():
+        split_pools = pools if name == "train" else {**pools, **build_pools(parts)}
         for n_, (px, py, ps, pw, pc, pfill) in enumerate(parts):
             if pfill.any():
                 parts[n_] = (
@@ -1758,7 +1923,7 @@ def build_symbol_dataset(
                     py,
                     ps,
                     pw,
-                    _fill_contexts(pc, py, pfill, pools, context_p, rng),
+                    _fill_contexts(pc, py, pfill, split_pools, context_p, rng),
                     pfill,
                 )
     for name, records in stroke_records.items():
@@ -1909,6 +2074,7 @@ def load_symbol_sources(path: Path, split: str = "train") -> np.ndarray | None:
 
 
 __all__ = [
+    "EDITOR_PEN_WIDTH",
     "PRESETS",
     "SOURCE_CROP",
     "SOURCE_FONT",
