@@ -220,3 +220,102 @@ def test_build_and_cli_symbols_writes_npz_and_image_folder(tmp_path: Path):
     assert report.counts == {"pedal": 4}
     assert (out_npz / "dataset.npz").exists()
     assert not (out_npz / "train").exists()
+
+
+def test_render_symbol_with_source_and_sample_sources():
+    from musicset.symbols import (
+        SOURCE_FONT,
+        SOURCE_STROKE,
+        generate_symbol_samples_with_sources,
+        render_symbol_with_source,
+    )
+
+    img, src = render_symbol_with_source("fing1", size=32, preset="tablet", rng=3)
+    assert np.array_equal(img, render_symbol("fing1", size=32, preset="tablet", rng=3))
+    assert src in (SOURCE_FONT, SOURCE_STROKE)
+    _, src_clean = render_symbol_with_source("fing1", size=32, preset="clean", rng=3)
+    assert src_clean == SOURCE_FONT
+
+    xs, ys, _classes, sources = generate_symbol_samples_with_sources(
+        20, groups=("fingering",), preset="tablet", seed=1
+    )
+    assert xs.shape == (100, 32, 32) and sources.shape == (100,) and sources.dtype == np.uint8
+    assert set(sources.tolist()) == {SOURCE_FONT, SOURCE_STROKE}
+    plain = generate_symbol_samples(20, groups=("fingering",), preset="tablet", seed=1)
+    assert np.array_equal(plain[0], xs) and np.array_equal(plain[1], ys)
+
+
+def test_group_split_keeps_each_score_in_one_split():
+    from musicset.symbols import _group_split_indices
+
+    rng = np.random.default_rng(0)
+    groups = np.array([f"score{i // 7}" for i in range(140)])  # 20 scores x 7 crops
+    idx = _group_split_indices(groups, (0.8, 0.1, 0.1), rng)
+    assert sorted(np.concatenate(list(idx.values())).tolist()) == list(range(140))
+    seen = {name: set(groups[i].tolist()) for name, i in idx.items()}
+    assert not (seen["train"] & seen["val"])
+    assert not (seen["train"] & seen["test"])
+    assert not (seen["val"] & seen["test"])
+    assert len(idx["test"]) >= 7 and len(idx["val"]) >= 7 and len(idx["train"]) >= 70
+
+
+def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Path):
+    from musicset.symbols import SOURCE_CROP, load_symbol_sources
+
+    ds = tmp_path / "built"
+    (ds / "pages").mkdir(parents=True)
+    (ds / "imgs").mkdir(parents=True)
+    img = np.full((200, 200), 255, dtype=np.uint8)
+    img[25:45, 25:40] = 0  # the engraved fingering digit
+    # Four scores, each engraving the identical fingering, plus a mordent box on blank paper
+    for k in range(4):
+        page = PageAnnotation(
+            score=f"s{k}",
+            page=1,
+            width=200.0,
+            height=200.0,
+            pixel_width=200.0,
+            pixel_height=200.0,
+            elements=[
+                Element("fg", ("fing",), (20, 20, 45, 50), text="2"),
+                Element("mrd", ("mordent",), (120, 120, 160, 150)),
+            ],
+            glyphs=[],
+        )
+        page.save(ds / "pages" / f"s{k}_page1{PAGE_SUFFIX}")
+        Image.fromarray(img, mode="L").save(ds / "imgs" / f"s{k}_page1.png")
+
+    out = tmp_path / "out"
+    report = build_symbol_dataset(
+        out,
+        samples_per_class=0,
+        from_dataset=ds,
+        groups=("fingering", "ornament"),
+        split=(0.5, 0.25, 0.25),
+        write_png=False,
+    )
+    assert report.removed == {"blank": 4, "duplicate": 3}
+    assert sum(report.splits.values()) == 1
+    assert report.source_counts["test"] == {"font": 0, "stroke": 0, "crop": 1}
+    with np.load(out / "dataset.npz") as data:
+        for split in ("train", "val", "test"):
+            assert data[f"s_{split}"].shape == data[f"y_{split}"].shape
+            assert set(data[f"s_{split}"].tolist()) <= {SOURCE_CROP}
+    assert load_symbol_sources(out, "test").tolist() == [SOURCE_CROP]
+    meta = json.loads((out / "labels.json").read_text())
+    assert meta["source_names"] == ["font", "stroke", "crop"]
+    assert meta["removed"] == {"blank": 4, "duplicate": 3}
+    assert meta["from_dataset"] == [str(ds)]
+    assert meta["crop_scores"] == {"train": 2, "val": 1, "test": 1}
+
+    # --no-dedup keeps all four identical crops, one score per split at most
+    kept = build_symbol_dataset(
+        tmp_path / "out2",
+        samples_per_class=0,
+        from_dataset=ds,
+        groups=("fingering",),
+        split=(0.5, 0.25, 0.25),
+        dedup=False,
+        write_png=False,
+    )
+    assert kept.removed == {"blank": 0, "duplicate": 0} and sum(kept.splits.values()) == 4

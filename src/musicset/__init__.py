@@ -12,6 +12,7 @@ from musicset.symbols import (
     extract_page_symbols,
     generate_symbol_samples,
     load_symbol_dataset,
+    load_symbol_sources,
     render_symbol,
 )
 from musicset.views.detection import ClassMap, detection_annotations
@@ -32,6 +33,7 @@ __all__ = [
     "extract_page_symbols",
     "generate_symbol_samples",
     "load_symbol_dataset",
+    "load_symbol_sources",
     "rasterize",
     "render_symbol",
 ]

@@ -386,14 +386,19 @@ def cmd_symbols(args: argparse.Namespace) -> None:
         strength=args.strength,
         invert=args.invert,
         split=(args.split[0], args.split[1], args.split[2]),
+        min_ink=args.min_ink,
+        dedup=not args.no_dedup,
         write_png=not args.no_png,
         seed=args.seed,
+        workers=args.workers,
     )
     logger.info(
-        "wrote %d symbols (%d classes, splits=%s) into %s",
+        "wrote %d symbols (%d classes, splits=%s, sources=%s, removed=%s) into %s",
         sum(report.splits.values()),
         len(report.classes),
         report.splits,
+        report.source_counts,
+        report.removed,
         report.out,
     )
 
@@ -583,6 +588,7 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser(
         "symbols",
+        parents=[common],
         help="MNIST-like isolated symbol dataset (fingerings 1-5, ornaments, articulations, ...)",
     )
     p.add_argument("out", type=Path, help="output directory (dataset.npz, labels.json, train/...)")
@@ -632,6 +638,14 @@ def main(argv: list[str] | None = None) -> None:
         default=[0.8, 0.1, 0.1],
         metavar=("TRAIN", "VAL", "TEST"),
         help="train/val/test split fractions",
+    )
+    p.add_argument(
+        "--min-ink", type=int, default=4, help="drop patches with fewer ink pixels (0: keep all)"
+    )
+    p.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="keep byte-identical images in several splits (default: one split only)",
     )
     p.add_argument("--no-png", action="store_true", help="write dataset.npz and labels.json only")
     p.add_argument("--seed", type=int, default=0)

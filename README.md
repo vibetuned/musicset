@@ -330,7 +330,17 @@ uv run musicset symbols data/symbols -n 500 --preset mixed --size 32
 uv run musicset symbols data/symbols -n 300 --from-dataset data/piano
 ```
 
-Writes both `dataset.npz` (`x_train`, `y_train`, `x_val`, `y_val`, `x_test`,
-`y_test`, `classes`, loaded via `musicset.load_symbol_dataset`) and an
-`ImageFolder` directory tree (`train/<class>/*.png`, `val/`, `test/`) alongside
-`labels.json`.
+Writes both `dataset.npz` (`x_train`, `y_train`, `s_train`, `x_val`, ...,
+`classes`, loaded via `musicset.load_symbol_dataset` /
+`musicset.load_symbol_sources`) and an `ImageFolder` directory tree
+(`train/<class>/*.png`, `val/`, `test/`) alongside `labels.json`, which also
+records the build settings and per-split counts.
+
+`s_<split>` holds each sample's source (`0` font glyph, `1` stylus stroke
+template, `2` score crop), so a classifier can report stylus and real-crop
+accuracy separately. Synthetic samples are split per class at random; score
+crops are split **by score**, never straddling splits. Patches with fewer than
+`--min-ink` ink pixels are dropped, and a byte-identical image is kept in one
+split only (`--no-dedup` to disable), since identical engravings of e.g. a
+fingering digit recur across pages and scores. Rendering and extraction run on
+`--workers` processes.

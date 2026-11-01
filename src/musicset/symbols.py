@@ -17,16 +17,24 @@ Outputs both a single compressed ``dataset.npz`` archive (``x_train``,
 ``y_train``, ``x_val``, ``y_val``, ``x_test``, ``y_test``, ``classes``) and an
 ``ImageFolder`` directory tree (``train/<class>/*.png``, ``val/``, ``test/``)
 with ``labels.json``.
+
+Every sample carries a source code (``s_train``, ``s_val``, ``s_test``:
+``SOURCE_FONT`` glyph render, ``SOURCE_STROKE`` stylus template, ``SOURCE_CROP``
+score crop). Score crops are split by score so one score never straddles
+splits, patches with too little ink are dropped, and a byte-identical image
+is kept in one split only, since identical engravings recur across scores.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import re
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -39,10 +47,15 @@ from svgpathtools import parse_path
 from musicset.annotate.geometry import BBox
 from musicset.annotate.schema import PageAnnotation
 from musicset.annotate.smufl import available_fonts, verovio_data_dir
+from musicset.parallel import map_pool
 from musicset.pipeline import PAGE_SUFFIX, page_file_stem
 
 SYMBOL_GROUPS = ("fingering", "ornament", "articulation", "accidental", "dynamic", "pedal")
 PRESETS = ("mixed", "tablet", "score", "clean")
+
+SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP = 0, 1, 2
+SOURCE_NAMES = ("font", "stroke", "crop")
+"""Per-sample provenance, stored as ``s_<split>`` in ``dataset.npz``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,7 +673,7 @@ def _augment_symbol(
     return np.clip(img, 0.0, 1.0)
 
 
-def render_symbol(
+def render_symbol_with_source(
     symbol: str | SymbolSpec,
     *,
     size: int = 32,
@@ -668,12 +681,9 @@ def render_symbol(
     strength: float = 1.0,
     invert: bool = False,
     rng: np.random.Generator | int | None = None,
-) -> np.ndarray:
-    """Render one ``(size, size)`` uint8 grayscale image of ``symbol``.
-
-    Default polarity is black ink on white paper (``0`` = ink, ``255`` = paper),
-    matching ``musicset`` page images; ``invert=True`` flips to white ink on
-    black background (classic MNIST polarity).
+) -> tuple[np.ndarray, int]:
+    """:func:`render_symbol` plus the sample's source: ``SOURCE_STROKE`` when a
+    stylus stroke template was drawn, else ``SOURCE_FONT``.
     """
     if preset not in PRESETS:
         raise ValueError(f"unknown preset {preset!r}: {PRESETS}")
@@ -709,7 +719,80 @@ def render_symbol(
     augmented = _augment_symbol(raw, preset=preset, strength=strength, rng=gen)
     pil = Image.fromarray((np.clip(augmented, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode="L")
     resized = np.asarray(pil.resize((size, size), Image.Resampling.BILINEAR), dtype=np.uint8)
-    return (255 - resized) if invert else resized
+    image = (255 - resized) if invert else resized
+    return image, (SOURCE_STROKE if use_strokes else SOURCE_FONT)
+
+
+def render_symbol(
+    symbol: str | SymbolSpec,
+    *,
+    size: int = 32,
+    preset: str = "mixed",
+    strength: float = 1.0,
+    invert: bool = False,
+    rng: np.random.Generator | int | None = None,
+) -> np.ndarray:
+    """Render one ``(size, size)`` uint8 grayscale image of ``symbol``.
+
+    Default polarity is black ink on white paper (``0`` = ink, ``255`` = paper),
+    matching ``musicset`` page images; ``invert=True`` flips to white ink on
+    black background (classic MNIST polarity).
+    """
+    image, _ = render_symbol_with_source(
+        symbol, size=size, preset=preset, strength=strength, invert=invert, rng=rng
+    )
+    return image
+
+
+def _run_tasks[A, T](
+    fn: Callable[[A], T], tasks: Sequence[A], workers: int | None, chunksize: int
+) -> Iterator[T]:
+    """``fn`` over ``tasks`` in order: inline for ``workers=1`` or small jobs, else pooled."""
+    if workers == 1 or len(tasks) < 2 * chunksize:
+        for task in tasks:
+            yield fn(task)
+        return
+    for task, outcome in map_pool(fn, tasks, workers=workers, chunksize=chunksize):
+        if not outcome.ok or outcome.value is None:
+            name = getattr(fn, "__name__", "task")
+            raise RuntimeError(f"{name} failed on {task!r}: {outcome.error}")
+        yield outcome.value
+
+
+def _render_task(task: tuple[str, int, str, float, bool, int, int, int]) -> tuple[np.ndarray, int]:
+    """One synthetic sample ``(image, source)``; seeded by ``(seed, class, k)``."""
+    name, size, preset, strength, invert, seed, cls_idx, k = task
+    rng = np.random.default_rng([seed, cls_idx, k])
+    return render_symbol_with_source(
+        name, size=size, preset=preset, strength=strength, invert=invert, rng=rng
+    )
+
+
+def _generate_symbol_samples(
+    samples_per_class: int,
+    *,
+    groups: Sequence[str] = SYMBOL_GROUPS,
+    size: int = 32,
+    preset: str = "mixed",
+    strength: float = 1.0,
+    invert: bool = False,
+    seed: int = 0,
+    workers: int | None = 1,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
+    specs = symbol_specs(groups)
+    class_names = tuple(s.name for s in specs)
+    tasks = [
+        (spec.name, size, preset, strength, invert, seed, cls_idx, k)
+        for cls_idx, spec in enumerate(specs)
+        for k in range(samples_per_class)
+    ]
+    images = np.empty((len(tasks), size, size), dtype=np.uint8)
+    labels = np.array([t[6] for t in tasks], dtype=np.int64)
+    sources = np.empty(len(tasks), dtype=np.uint8)
+    for idx, (image, source) in enumerate(_run_tasks(_render_task, tasks, workers, 256)):
+        images[idx] = image
+        sources[idx] = source
+    return images, labels, class_names, sources
 
 
 def generate_symbol_samples(
@@ -721,27 +804,51 @@ def generate_symbol_samples(
     strength: float = 1.0,
     invert: bool = False,
     seed: int = 0,
+    workers: int | None = 1,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
     """Synthesize ``samples_per_class`` images for each class in ``groups``.
 
     Returns ``(images, labels, class_names)`` with ``images`` of shape
-    ``(N, size, size)`` uint8 and ``labels`` of shape ``(N,)`` int64.
+    ``(N, size, size)`` uint8 and ``labels`` of shape ``(N,)`` int64. Each
+    sample is seeded by ``(seed, class, index)``, so ``workers`` only changes
+    the speed.
     """
-    specs = symbol_specs(groups)
-    class_names = tuple(s.name for s in specs)
-    total = len(specs) * samples_per_class
-    images = np.empty((total, size, size), dtype=np.uint8)
-    labels = np.empty(total, dtype=np.int64)
-    idx = 0
-    for cls_idx, spec in enumerate(specs):
-        for k in range(samples_per_class):
-            rng = np.random.default_rng([seed, cls_idx, k])
-            images[idx] = render_symbol(
-                spec, size=size, preset=preset, strength=strength, invert=invert, rng=rng
-            )
-            labels[idx] = cls_idx
-            idx += 1
+    images, labels, class_names, _ = _generate_symbol_samples(
+        samples_per_class,
+        groups=groups,
+        size=size,
+        preset=preset,
+        strength=strength,
+        invert=invert,
+        seed=seed,
+        workers=workers,
+    )
     return images, labels, class_names
+
+
+def generate_symbol_samples_with_sources(
+    samples_per_class: int,
+    *,
+    groups: Sequence[str] = SYMBOL_GROUPS,
+    size: int = 32,
+    preset: str = "mixed",
+    strength: float = 1.0,
+    invert: bool = False,
+    seed: int = 0,
+    workers: int | None = 1,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
+    """:func:`generate_symbol_samples` plus per-sample source codes (uint8,
+    ``SOURCE_FONT`` or ``SOURCE_STROKE``)."""
+    return _generate_symbol_samples(
+        samples_per_class,
+        groups=groups,
+        size=size,
+        preset=preset,
+        strength=strength,
+        invert=invert,
+        seed=seed,
+        workers=workers,
+    )
 
 
 # =============================================================================
@@ -893,6 +1000,127 @@ def _fingering_id_map(pages_dir: Path) -> dict[str, str]:
     return mapping
 
 
+_PAGE_STEM_RE = re.compile(r"_page\d+$")
+
+
+def _score_of_stem(stem: str) -> str:
+    """``<score>_page<N>`` -> ``<score>``."""
+    return _PAGE_STEM_RE.sub("", stem)
+
+
+def _extract_page_task(
+    task: tuple[Path, Path, tuple[str, ...], int, bool],
+) -> list[tuple[str, np.ndarray, str]]:
+    """``(class, patch, score)`` crops of one canonical ``pages/`` page."""
+    page_path, img_path, groups, size, invert = task
+    page = PageAnnotation.load(page_path)
+    return [
+        (cls, patch, page.score)
+        for cls, patch in extract_page_symbols(
+            page, img_path, groups=groups, size=size, invert=invert
+        )
+    ]
+
+
+def _extract_annotation_task(
+    task: tuple[Path, Path, dict[str, str], frozenset[str], int, bool],
+) -> list[tuple[str, np.ndarray, str]]:
+    """``(class, patch, score)`` crops of one ``annotations/*.json`` page."""
+    ann_path, img_path, fing_ids, allowed, size, invert = task
+    record = json.loads(ann_path.read_text(encoding="utf-8"))
+    with Image.open(img_path) as im:
+        grey = np.asarray(im.convert("L"), dtype=np.uint8)
+    score = _score_of_stem(ann_path.stem)
+    crops: list[tuple[str, np.ndarray, str]] = []
+    for ann in record.get("annotations", []):
+        cls = ann.get("class", "")
+        if cls == "fing":
+            text = str(ann.get("text", "")).strip()
+            if text in ("1", "2", "3", "4", "5"):
+                cls = f"fing{text}"
+            elif ann.get("id") in fing_ids:
+                cls = fing_ids[ann["id"]]
+        if cls not in allowed:
+            continue
+        patch = _crop_box_to_patch(grey, ann["bbox"], size, invert=invert)
+        if patch is not None:
+            crops.append((cls, patch, score))
+    return crops
+
+
+def _extract_dataset_symbols(
+    dataset: Path | Sequence[Path],
+    *,
+    groups: Sequence[str] = SYMBOL_GROUPS,
+    size: int = 32,
+    invert: bool = False,
+    max_per_class: int = 0,
+    seed: int = 0,
+    workers: int | None = 1,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
+    roots = [dataset] if isinstance(dataset, Path) else list(dataset)
+    specs = symbol_specs(groups)
+    class_names = tuple(s.name for s in specs)
+    class_to_idx = {name: i for i, name in enumerate(class_names)}
+    allowed = frozenset(class_to_idx)
+    groups_t = tuple(groups)
+
+    page_tasks: list[tuple[Path, Path, tuple[str, ...], int, bool]] = []
+    ann_tasks: list[tuple[Path, Path, dict[str, str], frozenset[str], int, bool]] = []
+    for root in roots:
+        pages_dir = root / "pages"
+        imgs_dir = root / "imgs"
+        ann_dir = root / "annotations"
+        page_files = sorted(pages_dir.glob(f"*{PAGE_SUFFIX}")) if pages_dir.is_dir() else []
+        if page_files:
+            for page_path in page_files:
+                img_path = imgs_dir / f"{page_file_stem(page_path)}.png"
+                if img_path.exists():
+                    page_tasks.append((page_path, img_path, groups_t, size, invert))
+        elif ann_dir.is_dir():
+            fing_ids = _fingering_id_map(pages_dir)
+            for ann_path in sorted(ann_dir.glob("*.json")):
+                img_path = imgs_dir / f"{ann_path.stem}.png"
+                if img_path.exists():
+                    ann_tasks.append((ann_path, img_path, fing_ids, allowed, size, invert))
+
+    by_class: dict[int, list[tuple[np.ndarray, str]]] = {i: [] for i in range(len(class_names))}
+    for crops in _run_tasks(_extract_page_task, page_tasks, workers, 8):
+        for cls, patch, score in crops:
+            by_class[class_to_idx[cls]].append((patch, score))
+    for crops in _run_tasks(_extract_annotation_task, ann_tasks, workers, 8):
+        for cls, patch, score in crops:
+            by_class[class_to_idx[cls]].append((patch, score))
+
+    rng = np.random.default_rng(seed)
+    images_list: list[np.ndarray] = []
+    labels_list: list[int] = []
+    scores_list: list[str] = []
+    for cls_idx, patches in by_class.items():
+        if not patches:
+            continue
+        if max_per_class > 0 and len(patches) > max_per_class:
+            order = rng.permutation(len(patches))[:max_per_class]
+            patches = [patches[int(i)] for i in order]
+        images_list.extend(p for p, _ in patches)
+        scores_list.extend(sc for _, sc in patches)
+        labels_list.extend([cls_idx] * len(patches))
+
+    if not images_list:
+        return (
+            np.empty((0, size, size), dtype=np.uint8),
+            np.empty(0, dtype=np.int64),
+            class_names,
+            np.empty(0, dtype=str),
+        )
+    return (
+        np.stack(images_list, axis=0),
+        np.array(labels_list, dtype=np.int64),
+        class_names,
+        np.array(scores_list, dtype=str),
+    )
+
+
 def extract_dataset_symbols(
     dataset: Path | Sequence[Path],
     *,
@@ -901,80 +1129,47 @@ def extract_dataset_symbols(
     invert: bool = False,
     max_per_class: int = 0,
     seed: int = 0,
+    workers: int | None = 1,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
     """Extract symbol crops across one or more built ``musicset`` dataset directories.
 
     Reads canonical ``pages/*.json.gz`` when present, falling back to
     ``annotations/*.json`` (for datasets produced by ``musicset augment``).
+    ``workers`` (``1``: inline, ``None``: musicset's default pool) only changes
+    the speed.
     """
-    roots = [dataset] if isinstance(dataset, Path) else list(dataset)
-    specs = symbol_specs(groups)
-    class_names = tuple(s.name for s in specs)
-    class_to_idx = {name: i for i, name in enumerate(class_names)}
-    allowed = set(class_to_idx)
+    images, labels, class_names, _ = _extract_dataset_symbols(
+        dataset,
+        groups=groups,
+        size=size,
+        invert=invert,
+        max_per_class=max_per_class,
+        seed=seed,
+        workers=workers,
+    )
+    return images, labels, class_names
 
-    by_class: dict[int, list[np.ndarray]] = {i: [] for i in range(len(class_names))}
-    for root in roots:
-        pages_dir = root / "pages"
-        imgs_dir = root / "imgs"
-        ann_dir = root / "annotations"
-        page_files = sorted(pages_dir.glob(f"*{PAGE_SUFFIX}")) if pages_dir.is_dir() else []
-        if page_files:
-            for page_path in page_files:
-                stem = page_file_stem(page_path)
-                img_path = imgs_dir / f"{stem}.png"
-                if not img_path.exists():
-                    continue
-                page = PageAnnotation.load(page_path)
-                for cls, patch in extract_page_symbols(
-                    page, img_path, groups=groups, size=size, invert=invert
-                ):
-                    by_class[class_to_idx[cls]].append(patch)
-        elif ann_dir.is_dir():
-            fing_ids = _fingering_id_map(pages_dir)
-            for ann_path in sorted(ann_dir.glob("*.json")):
-                img_path = imgs_dir / f"{ann_path.stem}.png"
-                if not img_path.exists():
-                    continue
-                record = json.loads(ann_path.read_text(encoding="utf-8"))
-                with Image.open(img_path) as im:
-                    grey = np.asarray(im.convert("L"), dtype=np.uint8)
-                for ann in record.get("annotations", []):
-                    cls = ann.get("class", "")
-                    if cls == "fing":
-                        text = str(ann.get("text", "")).strip()
-                        if text in ("1", "2", "3", "4", "5"):
-                            cls = f"fing{text}"
-                        elif ann.get("id") in fing_ids:
-                            cls = fing_ids[ann["id"]]
-                    if cls not in allowed:
-                        continue
-                    patch = _crop_box_to_patch(grey, ann["bbox"], size, invert=invert)
-                    if patch is not None:
-                        by_class[class_to_idx[cls]].append(patch)
 
-    rng = np.random.default_rng(seed)
-    images_list: list[np.ndarray] = []
-    labels_list: list[int] = []
-    for cls_idx, patches in by_class.items():
-        if not patches:
-            continue
-        if max_per_class > 0 and len(patches) > max_per_class:
-            order = rng.permutation(len(patches))[:max_per_class]
-            patches = [patches[int(i)] for i in order]
-        images_list.extend(patches)
-        labels_list.extend([cls_idx] * len(patches))
-
-    if not images_list:
-        return (
-            np.empty((0, size, size), dtype=np.uint8),
-            np.empty(0, dtype=np.int64),
-            class_names,
-        )
-    return (
-        np.stack(images_list, axis=0),
-        np.array(labels_list, dtype=np.int64),
-        class_names,
+def extract_dataset_symbols_with_scores(
+    dataset: Path | Sequence[Path],
+    *,
+    groups: Sequence[str] = SYMBOL_GROUPS,
+    size: int = 32,
+    invert: bool = False,
+    max_per_class: int = 0,
+    seed: int = 0,
+    workers: int | None = 1,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
+    """:func:`extract_dataset_symbols` plus the score name each crop came from,
+    the grouping key of the train/val/test split."""
+    return _extract_dataset_symbols(
+        dataset,
+        groups=groups,
+        size=size,
+        invert=invert,
+        max_per_class=max_per_class,
+        seed=seed,
+        workers=workers,
     )
 
 
@@ -989,21 +1184,27 @@ class SymbolDatasetReport:
     classes: tuple[str, ...]
     counts: dict[str, int]
     splits: dict[str, int]
+    source_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    """``{split: {source name: samples}}``."""
+    removed: dict[str, int] = field(default_factory=dict)
+    """Samples dropped: ``blank`` (under ``min_ink`` ink pixels) and ``duplicate``."""
 
 
-def _stratified_split(
-    images: np.ndarray,
-    labels: np.ndarray,
-    ratios: tuple[float, float, float],
-    rng: np.random.Generator,
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Split ``(images, labels)`` into ``train``, ``val``, ``test`` per class."""
+def _normalized_ratios(ratios: tuple[float, float, float]) -> tuple[float, float, float]:
     r_train, r_val, r_test = ratios
     total_r = r_train + r_val + r_test
     if total_r <= 0 or min(ratios) < 0:
         raise ValueError(f"invalid split ratios {ratios}")
-    r_train, r_val, r_test = r_train / total_r, r_val / total_r, r_test / total_r
+    return r_train / total_r, r_val / total_r, r_test / total_r
 
+
+def _stratified_split_indices(
+    labels: np.ndarray,
+    ratios: tuple[float, float, float],
+    rng: np.random.Generator,
+) -> dict[str, np.ndarray]:
+    """Per-class random split of sample indices into ``train``, ``val``, ``test``."""
+    _, r_val, r_test = _normalized_ratios(ratios)
     buckets: dict[str, list[int]] = {"train": [], "val": [], "test": []}
     for cls_idx in np.unique(labels):
         indices = np.flatnonzero(labels == cls_idx)
@@ -1018,13 +1219,45 @@ def _stratified_split(
         buckets["train"].extend(indices[:n_train].tolist())
         buckets["val"].extend(indices[n_train : n_train + n_val].tolist())
         buckets["test"].extend(indices[n_train + n_val :].tolist())
+    return {k: np.array(v, dtype=np.int64) for k, v in buckets.items()}
 
-    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for split, idxs in buckets.items():
-        arr = np.array(idxs, dtype=np.int64)
-        rng.shuffle(arr)
-        out[split] = (images[arr], labels[arr])
-    return out
+
+def _group_split_indices(
+    groups: np.ndarray,
+    ratios: tuple[float, float, float],
+    rng: np.random.Generator,
+) -> dict[str, np.ndarray]:
+    """Split sample indices so every group (score) lands in exactly one split.
+
+    Groups are shuffled and dealt to ``test``, then ``val``, until each holds
+    its share of the samples; the remaining groups are ``train``.
+    """
+    _, r_val, r_test = _normalized_ratios(ratios)
+    names, inverse = np.unique(groups, return_inverse=True)
+    sizes = np.bincount(inverse, minlength=len(names))
+    want = {"test": r_test * len(groups), "val": r_val * len(groups)}
+    filled = {"test": 0, "val": 0}
+    assign = np.full(len(names), "train", dtype=object)
+    for g in rng.permutation(len(names)):
+        for split in ("test", "val"):
+            if filled[split] < want[split]:
+                assign[g] = split
+                filled[split] += int(sizes[g])
+                break
+    split_of_sample = assign[inverse]
+    return {
+        name: np.flatnonzero(split_of_sample == name).astype(np.int64)
+        for name in ("train", "val", "test")
+    }
+
+
+def _ink_pixels(images: np.ndarray, invert: bool) -> np.ndarray:
+    ink = images > 127 if invert else images < 128
+    return ink.reshape(len(images), -1).sum(axis=1)
+
+
+def _image_hashes(images: np.ndarray) -> list[bytes]:
+    return [hashlib.blake2b(img.tobytes(), digest_size=16).digest() for img in images]
 
 
 def build_symbol_dataset(
@@ -1039,16 +1272,25 @@ def build_symbol_dataset(
     strength: float = 1.0,
     invert: bool = False,
     split: tuple[float, float, float] = (0.8, 0.1, 0.1),
+    min_ink: int = 4,
+    dedup: bool = True,
     write_png: bool = True,
     seed: int = 0,
+    workers: int | None = 1,
 ) -> SymbolDatasetReport:
     """Build a complete MNIST-like symbol dataset into ``out``.
 
+    Synthetic samples are split per class at random; score crops are split by
+    score, so crops of one score never land in two splits. Patches with fewer
+    than ``min_ink`` ink pixels are dropped, and with ``dedup`` a byte-identical
+    image is kept in one split only (``test`` wins over ``val`` over ``train``),
+    since identical engravings recur across pages and scores.
+
     Writes:
-    * ``out/dataset.npz`` (``x_train``, ``y_train``, ``x_val``, ``y_val``,
-      ``x_test``, ``y_test``, ``classes``);
-    * ``out/labels.json`` (class list, index map, group map, per-class and
-      per-split counts);
+    * ``out/dataset.npz`` (``x_<split>``, ``y_<split>``, ``s_<split>`` source
+      codes indexing ``SOURCE_NAMES``, ``classes``);
+    * ``out/labels.json`` (class list, index map, group map, build settings,
+      per-class, per-split and per-source counts, removed samples);
     * ``out/<split>/<class>/<index>.png`` when ``write_png=True``.
     """
     if samples_per_class < 0:
@@ -1058,11 +1300,14 @@ def build_symbol_dataset(
 
     specs = symbol_specs(groups)
     class_names = tuple(s.name for s in specs)
-    parts_x: list[np.ndarray] = []
-    parts_y: list[np.ndarray] = []
+    rng = np.random.default_rng(seed)
+    removed = {"blank": 0, "duplicate": 0}
+    # (images, labels, sources, split indices) per origin
+    parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]] = []
+    crop_scores: dict[str, int] = {}
 
     if samples_per_class > 0:
-        sx, sy, _ = generate_symbol_samples(
+        sx, sy, _, ss = _generate_symbol_samples(
             samples_per_class,
             groups=groups,
             size=size,
@@ -1070,52 +1315,80 @@ def build_symbol_dataset(
             strength=strength,
             invert=invert,
             seed=seed,
+            workers=workers,
         )
-        parts_x.append(sx)
-        parts_y.append(sy)
+        inked = _ink_pixels(sx, invert) >= min_ink
+        removed["blank"] += int((~inked).sum())
+        sx, sy, ss = sx[inked], sy[inked], ss[inked]
+        parts.append((sx, sy, ss, _stratified_split_indices(sy, split, rng)))
 
     if from_dataset:
-        cx, cy, _ = extract_dataset_symbols(
+        cx, cy, _, cg = _extract_dataset_symbols(
             from_dataset,
             groups=groups,
             size=size,
             invert=invert,
             max_per_class=max_crops_per_class,
             seed=seed,
+            workers=workers,
         )
+        inked = _ink_pixels(cx, invert) >= min_ink
+        removed["blank"] += int((~inked).sum())
+        cx, cy, cg = cx[inked], cy[inked], cg[inked]
         if len(cx):
-            parts_x.append(cx)
-            parts_y.append(cy)
+            cs = np.full(len(cy), SOURCE_CROP, dtype=np.uint8)
+            idx = _group_split_indices(cg, split, rng)
+            crop_scores = {name: len(np.unique(cg[i])) for name, i in idx.items()}
+            parts.append((cx, cy, cs, idx))
 
-    images = (
-        np.concatenate(parts_x, axis=0) if parts_x else np.empty((0, size, size), dtype=np.uint8)
-    )
-    labels = np.concatenate(parts_y, axis=0) if parts_y else np.empty(0, dtype=np.int64)
+    splits: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for name in ("train", "val", "test"):
+        xs = [x[idx[name]] for x, _, _, idx in parts]
+        ys = [y[idx[name]] for _, y, _, idx in parts]
+        ss_ = [s[idx[name]] for _, _, s, idx in parts]
+        x = np.concatenate(xs) if xs else np.empty((0, size, size), dtype=np.uint8)
+        y = np.concatenate(ys) if ys else np.empty(0, dtype=np.int64)
+        s = np.concatenate(ss_) if ss_ else np.empty(0, dtype=np.uint8)
+        order = rng.permutation(len(y))
+        splits[name] = (x[order], y[order], s[order])
 
-    rng = np.random.default_rng(seed)
-    splits = _stratified_split(images, labels, split, rng)
+    if dedup:
+        seen: set[bytes] = set()
+        for name in ("test", "val", "train"):
+            x, y, s = splits[name]
+            keep = np.ones(len(y), dtype=bool)
+            for i, h in enumerate(_image_hashes(x)):
+                if h in seen:
+                    keep[i] = False
+                else:
+                    seen.add(h)
+            removed["duplicate"] += int((~keep).sum())
+            splits[name] = (x[keep], y[keep], s[keep])
 
     out.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out / "dataset.npz",
         x_train=splits["train"][0],
         y_train=splits["train"][1],
+        s_train=splits["train"][2],
         x_val=splits["val"][0],
         y_val=splits["val"][1],
+        s_val=splits["val"][2],
         x_test=splits["test"][0],
         y_test=splits["test"][1],
+        s_test=splits["test"][2],
         classes=np.array(class_names),
     )
 
     if write_png:
-        for split_name, (xs, ys) in splits.items():
-            if not len(xs):
+        for split_name, (xs_, ys_, _) in splits.items():
+            if not len(xs_):
                 continue
             split_dir = out / split_name
             for cls_name in class_names:
                 (split_dir / cls_name).mkdir(parents=True, exist_ok=True)
             counters: Counter[int] = Counter()
-            for img, cls_idx in zip(xs, ys, strict=True):
+            for img, cls_idx in zip(xs_, ys_, strict=True):
                 c = int(cls_idx)
                 k = counters[c]
                 counters[c] = k + 1
@@ -1123,11 +1396,17 @@ def build_symbol_dataset(
                     split_dir / class_names[c] / f"{k:06d}.png", compress_level=1
                 )
 
+    labels = np.concatenate([v[1] for v in splits.values()])
     counts = {name: int((labels == i).sum()) for i, name in enumerate(class_names)}
     split_counts = {k: len(v[1]) for k, v in splits.items()}
+    source_counts = {
+        k: {SOURCE_NAMES[c]: int((v[2] == c).sum()) for c in range(len(SOURCE_NAMES))}
+        for k, v in splits.items()
+    }
     by_group: dict[str, list[str]] = {}
-    for s in specs:
-        by_group.setdefault(s.group, []).append(s.name)
+    for spec in specs:
+        by_group.setdefault(spec.group, []).append(spec.name)
+    roots = [from_dataset] if isinstance(from_dataset, Path) else list(from_dataset or [])
 
     meta: dict[str, Any] = {
         "classes": list(class_names),
@@ -1136,11 +1415,30 @@ def build_symbol_dataset(
         "size": size,
         "invert": invert,
         "preset": preset,
+        "strength": strength,
+        "samples_per_class": samples_per_class,
+        "from_dataset": [str(p) for p in roots],
+        "max_crops_per_class": max_crops_per_class,
+        "split": list(split),
+        "min_ink": min_ink,
+        "dedup": dedup,
+        "seed": seed,
+        "source_names": list(SOURCE_NAMES),
         "counts": counts,
         "splits": split_counts,
+        "source_counts": source_counts,
+        "crop_scores": crop_scores,
+        "removed": removed,
     }
     (out / "labels.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return SymbolDatasetReport(out=out, classes=class_names, counts=counts, splits=split_counts)
+    return SymbolDatasetReport(
+        out=out,
+        classes=class_names,
+        counts=counts,
+        splits=split_counts,
+        source_counts=source_counts,
+        removed=removed,
+    )
 
 
 def load_symbol_dataset(
@@ -1158,8 +1456,22 @@ def load_symbol_dataset(
         )
 
 
+def load_symbol_sources(path: Path, split: str = "train") -> np.ndarray | None:
+    """Per-sample source codes (indices into ``SOURCE_NAMES``) for ``split``, or
+    ``None`` for an archive built before sources were recorded."""
+    if split not in ("train", "val", "test"):
+        raise ValueError(f"unknown split {split!r}: ('train', 'val', 'test')")
+    npz_path = path / "dataset.npz" if path.is_dir() else path
+    with np.load(npz_path) as data:
+        return data.get(f"s_{split}")
+
+
 __all__ = [
     "PRESETS",
+    "SOURCE_CROP",
+    "SOURCE_FONT",
+    "SOURCE_NAMES",
+    "SOURCE_STROKE",
     "SYMBOLS",
     "SYMBOL_BY_NAME",
     "SYMBOL_GROUPS",
@@ -1167,10 +1479,14 @@ __all__ = [
     "SymbolSpec",
     "build_symbol_dataset",
     "extract_dataset_symbols",
+    "extract_dataset_symbols_with_scores",
     "extract_page_symbols",
     "generate_symbol_samples",
+    "generate_symbol_samples_with_sources",
     "load_symbol_dataset",
+    "load_symbol_sources",
     "page_symbol_boxes",
     "render_symbol",
+    "render_symbol_with_source",
     "symbol_specs",
 ]
