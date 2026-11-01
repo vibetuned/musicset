@@ -380,6 +380,9 @@ def cmd_symbols(args: argparse.Namespace) -> None:
         samples_per_class=args.samples_per_class,
         from_dataset=args.from_dataset,
         max_crops_per_class=args.max_crops_per_class,
+        homus=args.homus,
+        homus_copies=args.homus_copies,
+        homus_brush=args.homus_brush,
         groups=tuple(args.groups) if args.groups else SYMBOL_GROUPS,
         size=args.size,
         preset=args.preset,
@@ -613,10 +616,40 @@ def main(argv: list[str] | None = None) -> None:
         help="at most N extracted crops per class (0: all)",
     )
     p.add_argument(
+        "--homus",
+        type=Path,
+        default=None,
+        help="HOMUS.zip or its extracted directory: real pen strokes, split by writer",
+    )
+    p.add_argument(
+        "--homus-copies",
+        type=int,
+        default=1,
+        help="augmented renderings of each HOMUS training sample",
+    )
+    p.add_argument(
+        "--homus-brush",
+        type=float,
+        default=0.0,
+        help="probability of rendering a HOMUS training sample with a pressure brush",
+    )
+    p.add_argument(
         "--groups",
         nargs="+",
-        choices=("fingering", "ornament", "articulation", "accidental", "dynamic", "pedal"),
-        help="symbol groups to include (default: all six)",
+        choices=(
+            "fingering",
+            "ornament",
+            "articulation",
+            "accidental",
+            "dynamic",
+            "pedal",
+            "note",
+            "rest",
+            "clef",
+            "timesig",
+            "barline",
+        ),
+        help="symbol groups to include (default: all)",
     )
     p.add_argument(
         "--preset",

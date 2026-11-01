@@ -28,7 +28,10 @@ from musicset.symbols import (
 
 def test_symbol_catalog_covers_fingerings_1_to_5_and_all_groups():
     names = [s.name for s in SYMBOLS]
-    assert len(names) == len(set(names)) == 33
+    assert len(names) == len(set(names)) == 61
+    assert (
+        names[:33] == [s.name for s in SYMBOLS[:33]] and names[32] == "pedal"
+    )  # old indices stable
     assert [s.name for s in symbol_specs(("fingering",))] == [
         "fing1",
         "fing2",
@@ -296,14 +299,15 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
     )
     assert report.removed == {"blank": 4, "duplicate": 3}
     assert sum(report.splits.values()) == 1
-    assert report.source_counts["test"] == {"font": 0, "stroke": 0, "crop": 1}
+    assert report.source_counts["test"] == {"font": 0, "stroke": 0, "crop": 1, "hand": 0}
     with np.load(out / "dataset.npz") as data:
         for split in ("train", "val", "test"):
             assert data[f"s_{split}"].shape == data[f"y_{split}"].shape
+            assert (data[f"w_{split}"] == -1).all()
             assert set(data[f"s_{split}"].tolist()) <= {SOURCE_CROP}
     assert load_symbol_sources(out, "test").tolist() == [SOURCE_CROP]
     meta = json.loads((out / "labels.json").read_text())
-    assert meta["source_names"] == ["font", "stroke", "crop"]
+    assert meta["source_names"] == ["font", "stroke", "crop", "hand"]
     assert meta["removed"] == {"blank": 4, "duplicate": 3}
     assert meta["from_dataset"] == [str(ds)]
     assert meta["crop_scores"] == {"train": 2, "val": 1, "test": 1}
@@ -319,3 +323,84 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
         write_png=False,
     )
     assert kept.removed == {"blank": 0, "duplicate": 0} and sum(kept.splits.values()) == 4
+
+
+def test_composite_time_signature_and_barline_render_ink():
+    stacked = render_symbol("timeSig12over8", size=32, preset="clean", rng=0)
+    single = render_symbol("timeSigCommon", size=32, preset="clean", rng=0)
+    assert (stacked < 128).sum() > (single < 128).sum() > 10
+    rows = (stacked < 128).any(axis=1).nonzero()[0]
+    assert rows.max() - rows.min() >= 16  # two stacked rows fill most of the height
+    bar = render_symbol("barlineSingle", size=32, preset="clean", rng=1)
+    cols = (bar < 128).any(axis=0).nonzero()[0]
+    rows = (bar < 128).any(axis=1).nonzero()[0]
+    assert rows.max() - rows.min() >= 14 and cols.max() - cols.min() <= 8
+
+
+def test_homus_reader_rendering_and_writer_split(tmp_path: Path):
+    import shutil
+
+    from musicset.homus import HOMUS_CLASSES, load_homus, parse_homus, stroke_fraction
+    from musicset.symbols import SOURCE_HAND, render_strokes_sample
+
+    assert len(HOMUS_CLASSES) == 32 and set(HOMUS_CLASSES.values()) <= set(SYMBOL_BY_NAME)
+    label, strokes = parse_homus("G-Clef\n10,10;12,40;14,90;\n\n30,20;40,20;\n")
+    assert label == "G-Clef" and strokes == (
+        ((10.0, 10.0), (12.0, 40.0), (14.0, 90.0)),
+        ((30.0, 20.0), (40.0, 20.0)),
+    )
+    assert stroke_fraction(strokes) == 80 / 150
+    assert stroke_fraction([[(0, 0), (3, 3)]]) == 0.08  # a dot stays small
+
+    root = tmp_path / "HOMUS"
+    for w in (1, 2, 3):
+        d = root / str(w)
+        d.mkdir(parents=True)
+        # each writer draws a little differently, as real writers do
+        (d / f"{w}-1.txt").write_text(
+            f"G-Clef\n{10 + w},10;12,{40 + w};14,90;\n30,20;40,{20 + w};\n"
+        )
+        (d / f"{w}-2.txt").write_text(f"Dot\n{50 + w},50;{52 + w},{52 + w};\n")
+        (d / f"{w}-3.txt").write_text("Not-A-Class\n1,1;2,2;\n")
+    samples = load_homus(root)
+    assert len(samples) == 6 and {s.writer for s in samples} == {1, 2, 3}
+    assert {s.label for s in samples} == {"gClef", "augmentationDot"}
+    zpath = shutil.make_archive(str(tmp_path / "homus"), "zip", tmp_path, "HOMUS")
+    assert len(load_homus(Path(zpath))) == 6
+
+    clean = render_strokes_sample(samples[0].strokes, size=32, fraction=0.7, width=0.085)
+    again = render_strokes_sample(samples[0].strokes, size=32, fraction=0.7, width=0.085)
+    assert clean.shape == (32, 32) and np.array_equal(clean, again) and int(clean[0, 0]) == 255
+    rows = (clean < 128).any(axis=1).nonzero()[0]
+    assert 18 <= rows.max() - rows.min() + 1 <= 27  # ~70% of the canvas plus pen caps
+    dot = render_strokes_sample(samples[1].strokes, size=32, fraction=0.08, width=0.085)
+    assert 0 < (dot < 128).sum() < 40
+    augmented = render_strokes_sample(samples[0].strokes, size=32, preset="tablet", rng=3)
+    assert augmented.shape == (32, 32)
+    brushed = render_strokes_sample(samples[0].strokes, size=32, fraction=0.7, brush=True)
+    assert brushed.shape == (32, 32) and not np.array_equal(brushed, clean)
+    assert len(np.unique(brushed)) > len(np.unique(clean))  # soft edge adds grey levels
+
+    out = tmp_path / "out"
+    report = build_symbol_dataset(
+        out,
+        samples_per_class=0,
+        homus=root,
+        homus_copies=2,
+        homus_brush=0.5,
+        groups=("clef", "note"),
+        split=(0.34, 0.33, 0.33),
+        min_ink=1,
+        write_png=False,
+    )
+    assert report.splits == {"train": 4, "val": 2, "test": 2}  # train writer rendered twice
+    assert report.source_counts["test"] == {"font": 0, "stroke": 0, "crop": 0, "hand": 2}
+    meta = json.loads((out / "labels.json").read_text())
+    assert meta["homus_writers"] == {"train": 1, "val": 1, "test": 1}
+    assert meta["source_names"] == ["font", "stroke", "crop", "hand"]
+    with np.load(out / "dataset.npz") as data:
+        assert set(data["s_test"].tolist()) == {SOURCE_HAND}
+        assert set(data["w_test"].tolist()) <= {1, 2, 3} and len(set(data["w_train"].tolist())) == 1
+    records = json.loads((out / "strokes_test.json").read_text())
+    assert len(records) == 2 and {"writer", "label", "fraction", "strokes"} <= set(records[0])
+    assert (out / "strokes_val.json").is_file() and not (out / "strokes_train.json").exists()

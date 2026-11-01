@@ -8,6 +8,9 @@ Two sources feed the dataset, alone or combined:
   Petaluma) plus stylus-drawn stroke templates for fingerings 1-5 and common
   score markings, varied with affine jitter, elastic stroke deformation,
   thickness/pressure modulation and scan/tablet noise.
+* **HOMUS pen strokes** (:mod:`musicset.homus`): 15,200 symbols drawn on a
+  tablet by 100 writers, rasterised like the stroke templates; writers never
+  straddle splits.
 * **Score crops** (:func:`extract_dataset_symbols`): bounding-box crops pulled
   off rendered pages of a built ``musicset`` dataset (``pages/`` + ``imgs/``,
   or ``annotations/`` + ``imgs/``), with ``fing`` elements split into
@@ -36,26 +39,41 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import cache
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from scipy import ndimage
 from svgpathtools import parse_path
 
 from musicset.annotate.geometry import BBox
 from musicset.annotate.schema import PageAnnotation
 from musicset.annotate.smufl import available_fonts, verovio_data_dir
+from musicset.homus import Stroke, load_homus, stroke_fraction
 from musicset.parallel import map_pool
 from musicset.pipeline import PAGE_SUFFIX, page_file_stem
 
-SYMBOL_GROUPS = ("fingering", "ornament", "articulation", "accidental", "dynamic", "pedal")
+SYMBOL_GROUPS = (
+    "fingering",
+    "ornament",
+    "articulation",
+    "accidental",
+    "dynamic",
+    "pedal",
+    "note",
+    "rest",
+    "clef",
+    "timesig",
+    "barline",
+)
 PRESETS = ("mixed", "tablet", "score", "clean")
 
-SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP = 0, 1, 2
-SOURCE_NAMES = ("font", "stroke", "crop")
-"""Per-sample provenance, stored as ``s_<split>`` in ``dataset.npz``."""
+SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP, SOURCE_HAND = 0, 1, 2, 3
+SOURCE_NAMES = ("font", "stroke", "crop", "hand")
+"""Per-sample provenance, stored as ``s_<split>`` in ``dataset.npz``: SMuFL glyph
+render, stylus stroke template, score crop, real pen strokes (HOMUS)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +86,8 @@ class SymbolSpec:
     """Fraction of the target canvas the symbol's bounding box spans."""
     handwritten: bool = False
     """Whether a stylus stroke template is also available for tablet synthesis."""
+    compose: tuple[str, str] | None = None
+    """Time signature drawn from stacked SMuFL digits, ``(numerator, denominator)``."""
 
 
 SYMBOLS: tuple[SymbolSpec, ...] = (
@@ -224,6 +244,40 @@ SYMBOLS: tuple[SymbolSpec, ...] = (
         scale_range=(0.60, 0.86),
         handwritten=True,
     ),
+    # Notes: precomposed SMuFL notes, stem up and stem down merged (pitch is not the
+    # classifier's job: it comes from where the symbol sits on the staff)
+    SymbolSpec("noteWhole", "note", ("E1D2", "E0A2"), scale_range=(0.26, 0.46)),
+    SymbolSpec("noteHalf", "note", ("E1D3", "E1D4"), scale_range=(0.62, 0.88)),
+    SymbolSpec("noteQuarter", "note", ("E1D5", "E1D6"), scale_range=(0.62, 0.88)),
+    SymbolSpec("note8th", "note", ("E1D7", "E1D8"), scale_range=(0.62, 0.88)),
+    SymbolSpec("note16th", "note", ("E1D9", "E1DA"), scale_range=(0.62, 0.88)),
+    SymbolSpec("note32nd", "note", ("E1DB", "E1DC"), scale_range=(0.64, 0.90)),
+    SymbolSpec("note64th", "note", ("E1DD", "E1DE"), scale_range=(0.66, 0.90)),
+    SymbolSpec("augmentationDot", "note", ("E1E7",), scale_range=(0.10, 0.24)),
+    # Rests: whole and half rests share one shape and differ only by staff position
+    SymbolSpec("restWholeHalf", "rest", ("E4E3", "E4E4"), scale_range=(0.24, 0.44)),
+    SymbolSpec("restQuarter", "rest", ("E4E5",), scale_range=(0.52, 0.80)),
+    SymbolSpec("rest8th", "rest", ("E4E6",), scale_range=(0.42, 0.68)),
+    SymbolSpec("rest16th", "rest", ("E4E7",), scale_range=(0.50, 0.76)),
+    SymbolSpec("rest32nd", "rest", ("E4E8",), scale_range=(0.56, 0.82)),
+    SymbolSpec("rest64th", "rest", ("E4E9",), scale_range=(0.62, 0.88)),
+    # Clefs
+    SymbolSpec("gClef", "clef", ("E050",), scale_range=(0.70, 0.90)),
+    SymbolSpec("fClef", "clef", ("E062",), scale_range=(0.52, 0.78)),
+    SymbolSpec("cClef", "clef", ("E05C",), scale_range=(0.58, 0.84)),
+    # Time signatures: the single glyphs, then digit stacks composed at render time
+    SymbolSpec("timeSigCommon", "timesig", ("E08A",), scale_range=(0.36, 0.60)),
+    SymbolSpec("timeSigCutCommon", "timesig", ("E08B",), scale_range=(0.50, 0.78)),
+    SymbolSpec("timeSig2over2", "timesig", (), scale_range=(0.60, 0.86), compose=("2", "2")),
+    SymbolSpec("timeSig2over4", "timesig", (), scale_range=(0.60, 0.86), compose=("2", "4")),
+    SymbolSpec("timeSig3over4", "timesig", (), scale_range=(0.60, 0.86), compose=("3", "4")),
+    SymbolSpec("timeSig3over8", "timesig", (), scale_range=(0.60, 0.86), compose=("3", "8")),
+    SymbolSpec("timeSig4over4", "timesig", (), scale_range=(0.60, 0.86), compose=("4", "4")),
+    SymbolSpec("timeSig6over8", "timesig", (), scale_range=(0.60, 0.86), compose=("6", "8")),
+    SymbolSpec("timeSig9over8", "timesig", (), scale_range=(0.60, 0.86), compose=("9", "8")),
+    SymbolSpec("timeSig12over8", "timesig", (), scale_range=(0.62, 0.88), compose=("12", "8")),
+    # Barline: drawn as a bar, Verovio engraves it as a line rather than a glyph
+    SymbolSpec("barlineSingle", "barline", (), scale_range=(0.58, 0.86)),
 )
 
 SYMBOL_BY_NAME: dict[str, SymbolSpec] = {s.name: s for s in SYMBOLS}
@@ -235,7 +289,8 @@ _ELEMENT_SYMBOLS = frozenset(("trill", "mordent", "turn", "fermata", "arpeg", "p
 _GLYPH_TO_SYMBOL: dict[str, str] = {
     code: spec.name
     for spec in SYMBOLS
-    if spec.group in ("articulation", "accidental", "dynamic", "ornament", "pedal")
+    if spec.group
+    in ("articulation", "accidental", "dynamic", "ornament", "pedal", "note", "rest", "clef")
     for code in spec.codes
 }
 
@@ -315,6 +370,41 @@ def _arpeggio_contours(font: str, segments: int, arrow: bool) -> list[tuple[np.n
                 rotated = np.column_stack([shifted[:, 1], -shifted[:, 0]])
                 tiled.append((rotated, sign))
     return tiled
+
+
+def _timesig_contours(font: str, top: str, bottom: str) -> list[tuple[np.ndarray, int]]:
+    """Time signature as SMuFL digits (``E080``..``E089``) laid out in two stacked rows."""
+
+    def row(digits: str) -> list[tuple[np.ndarray, int]]:
+        pieces: list[tuple[np.ndarray, int]] = []
+        x = 0.0
+        for ch in digits:
+            code = f"E08{int(ch)}"
+            base = _glyph_Contours(font, code) or _glyph_Contours("Bravura", code)
+            assert base is not None
+            xs = np.vstack([pts for pts, _ in base])[:, 0]
+            pieces.extend((pts - [float(xs.min()) - x, 0.0], sign) for pts, sign in base)
+            x += float(xs.max() - xs.min()) * 1.08
+        return pieces
+
+    def bounds(contours: list[tuple[np.ndarray, int]]) -> tuple[np.ndarray, np.ndarray]:
+        pts = np.vstack([p for p, _ in contours])
+        return pts.min(axis=0), pts.max(axis=0)
+
+    top_c, bottom_c = row(top), row(bottom)
+    (tx0, ty0), (tx1, ty1) = bounds(top_c)
+    (bx0, by0), (bx1, _) = bounds(bottom_c)
+    gap = 0.06 * float(ty1 - ty0)
+    # y grows downwards: the top row ends just above 0, the bottom row starts just below
+    out = [(pts - [0.5 * (tx0 + tx1), float(ty1) + gap / 2], sign) for pts, sign in top_c]
+    out += [(pts - [0.5 * (bx0 + bx1), float(by0) - gap / 2], sign) for pts, sign in bottom_c]
+    return out
+
+
+def _barline_contours() -> list[tuple[np.ndarray, int]]:
+    """A single barline: a bar 8% as wide as it is tall."""
+    pts = np.array([[0.0, 0.0], [80.0, 0.0], [80.0, 1000.0], [0.0, 1000.0]], dtype=np.float64)
+    return [(pts, 1)]
 
 
 def _rasterize_contours(
@@ -555,27 +645,120 @@ def _handwritten_strokes(name: str, rng: np.random.Generator) -> list[list[tuple
     ]
 
 
+def _segment_widths(pts: Sequence[tuple[float, float]], width: int) -> list[int]:
+    """Pressure-like pen widths per segment: wide where the pen moves slowly, narrow where
+    fast. Mirrors ``granita.infer.predictor._segment_widths``; keep the two in sync."""
+    lengths = [math.dist(a, b) for a, b in pairwise(pts)]
+    ref = sorted(lengths)[len(lengths) // 2] if lengths else 0.0
+    if ref <= 1e-9:
+        return [width] * len(lengths)
+    return [max(1, round(width * min(1.3, max(0.55, 1.3 - 0.5 * (ln / ref))))) for ln in lengths]
+
+
 def _render_strokes(
     strokes: Sequence[Sequence[tuple[float, float]]],
     canvas: int,
     target_fraction: float,
     rng: np.random.Generator,
+    *,
+    width_frac: float | None = None,
+    jitter: bool = True,
+    brush: bool = False,
 ) -> np.ndarray:
-    """Render stylus strokes onto a ``(canvas, canvas)`` float32 canvas (1.0=paper, 0.0=ink)."""
+    """Render stylus strokes (normalised to ``[-1, 1]``) onto a ``(canvas, canvas)``
+    float32 canvas (1.0=paper, 0.0=ink).
+
+    The pen is ``width_frac`` canvas widths wide (random 0.055-0.115 when
+    unset) with round caps; ``jitter`` shifts the centre by up to 6%. ``brush``
+    imitates a pressure brush: each segment's width follows the pen speed and
+    the drawing gets a soft edge, exactly like ``granita.render_strokes(brush=True)``.
+    """
     img = Image.new("L", (canvas, canvas), 255)
     draw = ImageDraw.Draw(img)
     scale = canvas * 0.5 * target_fraction
-    cx = canvas * 0.5 + float(rng.uniform(-canvas * 0.06, canvas * 0.06))
-    cy = canvas * 0.5 + float(rng.uniform(-canvas * 0.06, canvas * 0.06))
-    width = max(2, round(canvas * float(rng.uniform(0.055, 0.115))))
+    shift = canvas * 0.06
+    cx = canvas * 0.5 + (float(rng.uniform(-shift, shift)) if jitter else 0.0)
+    cy = canvas * 0.5 + (float(rng.uniform(-shift, shift)) if jitter else 0.0)
+    frac = float(rng.uniform(0.055, 0.115)) if width_frac is None else width_frac
+    width = max(2, round(canvas * frac))
     for stroke in strokes:
         pts = [(cx + x * scale, cy + y * scale) for x, y in stroke]
-        if len(pts) >= 2:
-            draw.line(pts, fill=0, width=width, joint="curve")
+        if not pts:
+            continue
+        if brush and len(pts) >= 2:
+            widths = _segment_widths(pts, width)
+            for (a, b), w in zip(pairwise(pts), widths, strict=True):
+                draw.line([a, b], fill=0, width=w)
+                rr = w * 0.5
+                draw.ellipse((b[0] - rr, b[1] - rr, b[0] + rr, b[1] + rr), fill=0)
+            r = widths[0] * 0.5
+        else:
+            if len(pts) >= 2:
+                draw.line(pts, fill=0, width=width, joint="curve")
             r = width * 0.45
-            for px, py in (pts[0], pts[-1]):
-                draw.ellipse((px - r, py - r, px + r, py + r), fill=0)
+        for px, py in (pts[0], pts[-1]):
+            draw.ellipse((px - r, py - r, px + r, py + r), fill=0)
+    if brush:
+        img = img.filter(ImageFilter.GaussianBlur(radius=canvas * 0.012))
     return np.asarray(img, dtype=np.float32) / 255.0
+
+
+def normalize_strokes(
+    strokes: Sequence[Sequence[tuple[float, float]]],
+) -> list[list[tuple[float, float]]]:
+    """Centre raw pen strokes (any units) and scale them, aspect kept, into ``[-1, 1]``."""
+    points = [(float(x), float(y)) for stroke in strokes for x, y in stroke]
+    if not points:
+        raise ValueError("no stroke points")
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    cx, cy = 0.5 * (min(xs) + max(xs)), 0.5 * (min(ys) + max(ys))
+    half = 0.5 * max(max(xs) - min(xs), max(ys) - min(ys))
+    scale = 1.0 / half if half > 1e-9 else 0.0
+    return [
+        [((float(x) - cx) * scale, (float(y) - cy) * scale) for x, y in stroke]
+        for stroke in strokes
+        if len(stroke)
+    ]
+
+
+def render_strokes_sample(
+    strokes: Sequence[Sequence[tuple[float, float]]],
+    *,
+    size: int = 32,
+    fraction: float = 0.7,
+    width: float = 0.085,
+    preset: str = "clean",
+    strength: float = 1.0,
+    invert: bool = False,
+    brush: bool = False,
+    rng: np.random.Generator | int | None = None,
+) -> np.ndarray:
+    """Rasterise raw pen strokes (an editor's or HOMUS's) like a stylus template.
+
+    The strokes are centred with their longer side spanning ``fraction`` of the
+    canvas and drawn with a pen ``width`` canvas widths wide (``0.085`` is the
+    middle of the template range), or a pressure-like ``brush``.
+    ``preset="clean"`` is deterministic, the other presets add the tablet/scan
+    augmentations and centre jitter.
+    """
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}: {PRESETS}")
+    gen = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+    canvas = max(96, size * 3)
+    raw = _render_strokes(
+        normalize_strokes(strokes),
+        canvas,
+        fraction,
+        gen,
+        width_frac=width,
+        jitter=preset != "clean",
+        brush=brush,
+    )
+    augmented = _augment_symbol(raw, preset=preset, strength=strength, rng=gen)
+    pil = Image.fromarray((np.clip(augmented, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode="L")
+    resized = np.asarray(pil.resize((size, size), Image.Resampling.BILINEAR), dtype=np.uint8)
+    return (255 - resized) if invert else resized
 
 
 # =============================================================================
@@ -709,6 +892,12 @@ def render_symbol_with_source(
         arrow = bool(gen.random() < 0.35)
         contours = _arpeggio_contours(font, segs, arrow)
         raw = _rasterize_contours(contours, canvas, fraction, gen, jitter=jitter)
+    elif spec.compose is not None:
+        font = str(gen.choice(available_fonts()))
+        contours = _timesig_contours(font, *spec.compose)
+        raw = _rasterize_contours(contours, canvas, fraction, gen, jitter=jitter)
+    elif spec.name == "barlineSingle":
+        raw = _rasterize_contours(_barline_contours(), canvas, fraction, gen, jitter=jitter)
     else:
         candidates = [pair for code in spec.codes for pair in _available_font_codes(code)]
         font, code = candidates[int(gen.integers(len(candidates)))]
@@ -765,6 +954,32 @@ def _render_task(task: tuple[str, int, str, float, bool, int, int, int]) -> tupl
     rng = np.random.default_rng([seed, cls_idx, k])
     return render_symbol_with_source(
         name, size=size, preset=preset, strength=strength, invert=invert, rng=rng
+    )
+
+
+def _render_homus_task(
+    task: tuple[tuple[Stroke, ...], int, float, bool, int, int, int, bool, float],
+) -> np.ndarray:
+    """One HOMUS sample: augmented at its jittered natural size for ``train`` (pen
+    0.05-0.13 wide, a pressure brush with probability ``brush_p``), else
+    deterministic the way an editor would send it."""
+    strokes, size, strength, invert, seed, j, k, train, brush_p = task
+    rng = np.random.default_rng([seed, 3, j, k])
+    fraction = stroke_fraction(strokes)
+    if train:
+        return render_strokes_sample(
+            strokes,
+            size=size,
+            fraction=float(np.clip(fraction * rng.uniform(0.85, 1.15), 0.08, 0.9)),
+            width=float(rng.uniform(0.05, 0.13)),
+            preset="tablet",
+            strength=strength,
+            invert=invert,
+            brush=bool(rng.random() < brush_p),
+            rng=rng,
+        )
+    return render_strokes_sample(
+        strokes, size=size, fraction=fraction, width=0.085, preset="clean", invert=invert, rng=rng
     )
 
 
@@ -905,6 +1120,13 @@ def _crop_box_to_patch(
     return (255 - patch) if invert else patch
 
 
+def _is_single_dot(bbox: BBox | None) -> bool:
+    if bbox is None:
+        return False
+    w, h = float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1])
+    return w > 0 and h > 0 and max(w, h) / min(w, h) < 1.6
+
+
 def page_symbol_boxes(
     page: PageAnnotation,
     image_size: tuple[int, int],
@@ -934,6 +1156,12 @@ def page_symbol_boxes(
                 cls = f"fing{digit}"
         elif el.classes[0] in _ELEMENT_SYMBOLS:
             cls = el.classes[0]
+        elif el.classes[0] == "barLine" and (not el.refined or "barlineSingle" in el.refined):
+            cls = "barlineSingle"
+        elif el.classes[0] == "dots" and _is_single_dot(el.bbox):
+            # Verovio draws augmentation dots as plain circles, so there is no glyph to map;
+            # a chord's dots share one tall box, which is skipped
+            cls = "augmentationDot"
         if cls is not None and (allowed is None or cls in allowed):
             px_box = to_px(el.bbox)
             if px_box is not None:
@@ -1266,6 +1494,9 @@ def build_symbol_dataset(
     samples_per_class: int = 200,
     from_dataset: Path | Sequence[Path] | None = None,
     max_crops_per_class: int = 0,
+    homus: Path | None = None,
+    homus_copies: int = 1,
+    homus_brush: float = 0.0,
     groups: Sequence[str] = SYMBOL_GROUPS,
     size: int = 32,
     preset: str = "mixed",
@@ -1281,30 +1512,52 @@ def build_symbol_dataset(
     """Build a complete MNIST-like symbol dataset into ``out``.
 
     Synthetic samples are split per class at random; score crops are split by
-    score, so crops of one score never land in two splits. Patches with fewer
-    than ``min_ink`` ink pixels are dropped, and with ``dedup`` a byte-identical
-    image is kept in one split only (``test`` wins over ``val`` over ``train``),
-    since identical engravings recur across pages and scores.
+    score, so crops of one score never land in two splits. ``homus`` adds the
+    HOMUS pen strokes (``SOURCE_HAND``) split by writer: train samples are
+    rendered ``homus_copies`` times with tablet augmentation at their jittered
+    natural size (as a pressure brush with probability ``homus_brush``),
+    val/test samples once and deterministically, the way an
+    editor would send them, and their raw strokes are kept in
+    ``strokes_val.json`` / ``strokes_test.json`` for stroke-level evaluation.
+    Patches with fewer than ``min_ink`` ink pixels are dropped, and with
+    ``dedup`` a byte-identical image is kept in one split only (``test`` wins
+    over ``val`` over ``train``), since identical engravings recur across pages
+    and scores.
 
     Writes:
     * ``out/dataset.npz`` (``x_<split>``, ``y_<split>``, ``s_<split>`` source
-      codes indexing ``SOURCE_NAMES``, ``classes``);
+      codes indexing ``SOURCE_NAMES``, ``w_<split>`` HOMUS writer ids (``-1``
+      for other sources), ``classes``);
     * ``out/labels.json`` (class list, index map, group map, build settings,
       per-class, per-split and per-source counts, removed samples);
+    * ``out/strokes_<split>.json`` for HOMUS val/test samples;
     * ``out/<split>/<class>/<index>.png`` when ``write_png=True``.
     """
     if samples_per_class < 0:
         raise ValueError("samples_per_class must be >= 0")
-    if samples_per_class == 0 and not from_dataset:
-        raise ValueError("need samples_per_class > 0 or from_dataset")
+    if samples_per_class == 0 and not from_dataset and homus is None:
+        raise ValueError("need samples_per_class > 0, from_dataset or homus")
 
     specs = symbol_specs(groups)
     class_names = tuple(s.name for s in specs)
+    class_to_idx = {name: i for i, name in enumerate(class_names)}
     rng = np.random.default_rng(seed)
     removed = {"blank": 0, "duplicate": 0}
-    # (images, labels, sources, split indices) per origin
-    parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]] = []
+    pieces: dict[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = {
+        "train": [],
+        "val": [],
+        "test": [],
+    }
     crop_scores: dict[str, int] = {}
+    homus_writers: dict[str, int] = {}
+    stroke_records: dict[str, list[dict[str, Any]]] = {}
+
+    def keep_inked(
+        x: np.ndarray, y: np.ndarray, s: np.ndarray, g: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+        inked = _ink_pixels(x, invert) >= min_ink
+        removed["blank"] += int((~inked).sum())
+        return x[inked], y[inked], s[inked], (None if g is None else g[inked])
 
     if samples_per_class > 0:
         sx, sy, _, ss = _generate_symbol_samples(
@@ -1317,10 +1570,9 @@ def build_symbol_dataset(
             seed=seed,
             workers=workers,
         )
-        inked = _ink_pixels(sx, invert) >= min_ink
-        removed["blank"] += int((~inked).sum())
-        sx, sy, ss = sx[inked], sy[inked], ss[inked]
-        parts.append((sx, sy, ss, _stratified_split_indices(sy, split, rng)))
+        sx, sy, ss, _ = keep_inked(sx, sy, ss)
+        for name, idx in _stratified_split_indices(sy, split, rng).items():
+            pieces[name].append((sx[idx], sy[idx], ss[idx], np.full(len(idx), -1, np.int32)))
 
     if from_dataset:
         cx, cy, _, cg = _extract_dataset_symbols(
@@ -1332,30 +1584,77 @@ def build_symbol_dataset(
             seed=seed,
             workers=workers,
         )
-        inked = _ink_pixels(cx, invert) >= min_ink
-        removed["blank"] += int((~inked).sum())
-        cx, cy, cg = cx[inked], cy[inked], cg[inked]
-        if len(cx):
-            cs = np.full(len(cy), SOURCE_CROP, dtype=np.uint8)
-            idx = _group_split_indices(cg, split, rng)
-            crop_scores = {name: len(np.unique(cg[i])) for name, i in idx.items()}
-            parts.append((cx, cy, cs, idx))
+        cs = np.full(len(cy), SOURCE_CROP, dtype=np.uint8)
+        cx, cy, cs, cg_kept = keep_inked(cx, cy, cs, cg)
+        if len(cx) and cg_kept is not None:
+            idx = _group_split_indices(cg_kept, split, rng)
+            crop_scores = {name: len(np.unique(cg_kept[i])) for name, i in idx.items()}
+            for name, i in idx.items():
+                pieces[name].append((cx[i], cy[i], cs[i], np.full(len(i), -1, np.int32)))
 
-    splits: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    if homus is not None:
+        samples = [smp for smp in load_homus(homus) if smp.label in class_to_idx]
+        if samples:
+            writers = np.array([str(smp.writer) for smp in samples])
+            idx = _group_split_indices(writers, split, rng)
+            homus_writers = {name: len(np.unique(writers[i])) for name, i in idx.items()}
+            for name, i in idx.items():
+                train = name == "train"
+                copies = max(1, homus_copies) if train else 1
+                tasks = [
+                    (
+                        samples[j].strokes,
+                        size,
+                        strength,
+                        invert,
+                        seed,
+                        int(j),
+                        k,
+                        train,
+                        homus_brush,
+                    )
+                    for j in i.tolist()
+                    for k in range(copies)
+                ]
+                hx = np.empty((len(tasks), size, size), dtype=np.uint8)
+                hy = np.array(
+                    [class_to_idx[samples[j].label] for j in i.tolist() for _ in range(copies)],
+                    dtype=np.int64,
+                )
+                for n, image in enumerate(_run_tasks(_render_homus_task, tasks, workers, 64)):
+                    hx[n] = image
+                hs = np.full(len(hy), SOURCE_HAND, dtype=np.uint8)
+                hw = np.array(
+                    [samples[j].writer for j in i.tolist() for _ in range(copies)], dtype=np.int32
+                )
+                hx, hy, hs, hw_kept = keep_inked(hx, hy, hs, hw)
+                assert hw_kept is not None
+                pieces[name].append((hx, hy, hs, hw_kept))
+                if not train:
+                    stroke_records[name] = [
+                        {
+                            "writer": samples[j].writer,
+                            "label": samples[j].label,
+                            "fraction": stroke_fraction(samples[j].strokes),
+                            "strokes": [[list(p) for p in stroke] for stroke in samples[j].strokes],
+                        }
+                        for j in i.tolist()
+                    ]
+
+    splits: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     for name in ("train", "val", "test"):
-        xs = [x[idx[name]] for x, _, _, idx in parts]
-        ys = [y[idx[name]] for _, y, _, idx in parts]
-        ss_ = [s[idx[name]] for _, _, s, idx in parts]
-        x = np.concatenate(xs) if xs else np.empty((0, size, size), dtype=np.uint8)
-        y = np.concatenate(ys) if ys else np.empty(0, dtype=np.int64)
-        s = np.concatenate(ss_) if ss_ else np.empty(0, dtype=np.uint8)
+        parts = pieces[name]
+        x = np.concatenate([p[0] for p in parts]) if parts else np.empty((0, size, size), np.uint8)
+        y = np.concatenate([p[1] for p in parts]) if parts else np.empty(0, dtype=np.int64)
+        s = np.concatenate([p[2] for p in parts]) if parts else np.empty(0, dtype=np.uint8)
+        w = np.concatenate([p[3] for p in parts]) if parts else np.empty(0, dtype=np.int32)
         order = rng.permutation(len(y))
-        splits[name] = (x[order], y[order], s[order])
+        splits[name] = (x[order], y[order], s[order], w[order])
 
     if dedup:
         seen: set[bytes] = set()
         for name in ("test", "val", "train"):
-            x, y, s = splits[name]
+            x, y, s, w = splits[name]
             keep = np.ones(len(y), dtype=bool)
             for i, h in enumerate(_image_hashes(x)):
                 if h in seen:
@@ -1363,7 +1662,7 @@ def build_symbol_dataset(
                 else:
                     seen.add(h)
             removed["duplicate"] += int((~keep).sum())
-            splits[name] = (x[keep], y[keep], s[keep])
+            splits[name] = (x[keep], y[keep], s[keep], w[keep])
 
     out.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -1371,17 +1670,22 @@ def build_symbol_dataset(
         x_train=splits["train"][0],
         y_train=splits["train"][1],
         s_train=splits["train"][2],
+        w_train=splits["train"][3],
         x_val=splits["val"][0],
         y_val=splits["val"][1],
         s_val=splits["val"][2],
+        w_val=splits["val"][3],
         x_test=splits["test"][0],
         y_test=splits["test"][1],
         s_test=splits["test"][2],
+        w_test=splits["test"][3],
         classes=np.array(class_names),
     )
+    for name, records in stroke_records.items():
+        (out / f"strokes_{name}.json").write_text(json.dumps(records), encoding="utf-8")
 
     if write_png:
-        for split_name, (xs_, ys_, _) in splits.items():
+        for split_name, (xs_, ys_, _, _) in splits.items():
             if not len(xs_):
                 continue
             split_dir = out / split_name
@@ -1419,6 +1723,9 @@ def build_symbol_dataset(
         "samples_per_class": samples_per_class,
         "from_dataset": [str(p) for p in roots],
         "max_crops_per_class": max_crops_per_class,
+        "homus": None if homus is None else str(homus),
+        "homus_copies": homus_copies,
+        "homus_brush": homus_brush,
         "split": list(split),
         "min_ink": min_ink,
         "dedup": dedup,
@@ -1428,6 +1735,7 @@ def build_symbol_dataset(
         "splits": split_counts,
         "source_counts": source_counts,
         "crop_scores": crop_scores,
+        "homus_writers": homus_writers,
         "removed": removed,
     }
     (out / "labels.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -1470,6 +1778,7 @@ __all__ = [
     "PRESETS",
     "SOURCE_CROP",
     "SOURCE_FONT",
+    "SOURCE_HAND",
     "SOURCE_NAMES",
     "SOURCE_STROKE",
     "SYMBOLS",
@@ -1485,7 +1794,9 @@ __all__ = [
     "generate_symbol_samples_with_sources",
     "load_symbol_dataset",
     "load_symbol_sources",
+    "normalize_strokes",
     "page_symbol_boxes",
+    "render_strokes_sample",
     "render_symbol",
     "render_symbol_with_source",
     "symbol_specs",

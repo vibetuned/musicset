@@ -82,7 +82,7 @@ def _note_value(note, parents: dict, ppq: float) -> float | None:
     value = 1.0 / int(dur)
     dots = int(holder.get("dots", 0))
     if dots:
-        value *= 2.0 - 0.5 ** dots
+        value *= 2.0 - 0.5**dots
     anc = parents.get(holder)
     while anc is not None:
         if anc.tag == f"{MEI_NS}tuplet":
@@ -206,7 +206,7 @@ def kern_bags(path: Path) -> tuple[dict, dict]:
                 value = 1.0 / int(dur_m.group(1))
                 dots = sub.count(".")
                 if dots:
-                    value *= 2.0 - 0.5 ** dots
+                    value *= 2.0 - 0.5**dots
                 r_bag[(*key, round(value, 4))] += 1
     return pitch_bags, rhythm_bags
 

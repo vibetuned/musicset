@@ -320,7 +320,16 @@ six groups (`--groups`):
 - **dynamic**: `dynamicPiano`, `dynamicMezzo`, `dynamicForte`,
   `dynamicSforzando`, `dynamicZ`, `dynamicPP`, `dynamicMP`, `dynamicMF`,
   `dynamicFF`, `dynamicFFF`, `dynamicForzando`, `dynamicSforzato`;
-- **pedal**: `pedal`.
+- **pedal**: `pedal`;
+- **note**: `noteWhole`, `noteHalf`, `noteQuarter`, `note8th`, `note16th`,
+  `note32nd`, `note64th` (stem direction merged) and `augmentationDot`;
+- **rest**: `restWholeHalf` (one shape, two staff positions), `restQuarter`,
+  `rest8th`, `rest16th`, `rest32nd`, `rest64th`;
+- **clef**: `gClef`, `fClef`, `cClef`;
+- **timesig**: `timeSigCommon`, `timeSigCutCommon` and the digit stacks
+  `timeSig2over2`, `2over4`, `3over4`, `3over8`, `4over4`, `6over8`, `9over8`,
+  `12over8`;
+- **barline**: `barlineSingle`.
 
 ```bash
 # Synthetic (SMuFL fonts + stylus stroke templates with elastic/tablet/scan augmentation)
@@ -328,6 +337,9 @@ uv run musicset symbols data/symbols -n 500 --preset mixed --size 32
 
 # Combine synthetic samples with real crops extracted from a built score dataset
 uv run musicset symbols data/symbols -n 300 --from-dataset data/piano
+
+# Add the HOMUS pen-stroke dataset (15,200 symbols, 100 writers; writers never straddle splits)
+uv run musicset symbols data/symbols -n 300 --homus ~/data/HOMUS.zip --homus-copies 2
 ```
 
 Writes both `dataset.npz` (`x_train`, `y_train`, `s_train`, `x_val`, ...,
@@ -337,8 +349,10 @@ Writes both `dataset.npz` (`x_train`, `y_train`, `s_train`, `x_val`, ...,
 records the build settings and per-split counts.
 
 `s_<split>` holds each sample's source (`0` font glyph, `1` stylus stroke
-template, `2` score crop), so a classifier can report stylus and real-crop
-accuracy separately. Synthetic samples are split per class at random; score
+template, `2` score crop, `3` real pen strokes from HOMUS), so a classifier can
+report stylus and real-crop accuracy separately. HOMUS val/test samples are
+rendered once, deterministically, at their natural size, and their raw strokes
+are kept in `strokes_val.json` / `strokes_test.json` for stroke-level tests. Synthetic samples are split per class at random; score
 crops are split **by score**, never straddling splits. Patches with fewer than
 `--min-ink` ink pixels are dropped, and a byte-identical image is kept in one
 split only (`--no-dedup` to disable), since identical engravings of e.g. a

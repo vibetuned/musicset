@@ -1592,7 +1592,11 @@ class MinimalHumdrumSerializer:
         return owner
 
     def _events_by_staff_band(
-        self, staves: list, staff_rows: list, children: dict, nodes: dict,
+        self,
+        staves: list,
+        staff_rows: list,
+        children: dict,
+        nodes: dict,
         measure_id: str | None = None,
     ) -> dict:
         """Each staff cell's events, a multiply-reached event kept by one cell.
@@ -1639,8 +1643,10 @@ class MinimalHumdrumSerializer:
             y = self._event_y(event_id, children, nodes)
             band_row = rows[sum(y > b for b in bounds)]
             in_band = [i for i in cells if tuple(staff_rows[i]) == band_row]
-            owner[event_id] = in_band[0] if in_band else min(
-                cells, key=lambda i: abs(y - (staff_rows[i][1] + staff_rows[i][3]) / 2.0)
+            owner[event_id] = (
+                in_band[0]
+                if in_band
+                else min(cells, key=lambda i: abs(y - (staff_rows[i][1] + staff_rows[i][3]) / 2.0))
             )
         result = {}
         for idx, staff_id in enumerate(staves):

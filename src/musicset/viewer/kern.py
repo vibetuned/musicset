@@ -82,7 +82,9 @@ class Engraver(QObject):
             try:
                 run = subprocess.run(
                     [sys.executable, "-c", ENGRAVE, str(krn), str(prefix)],
-                    capture_output=True, text=True, timeout=300,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
                 )
                 if run.returncode == 0:
                     files = json.loads(run.stdout.strip().splitlines()[-1])
