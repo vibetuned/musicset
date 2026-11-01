@@ -22,6 +22,8 @@ FLATS_ORDER = ["B", "E", "A", "D", "G", "C", "F"]
 ACCID_ALTER = {"s": 1, "f": -1, "n": 0, "ss": 2, "x": 2, "ff": -2}
 KERN_ALTER = {"#": 1, "##": 2, "-": -1, "--": -2, "n": 0, "": 0}
 KERN_NOTE = re.compile(r"([a-gA-G]+)(##|--|#|-|n)?")
+# MEI durations longer than a whole note, in whole notes
+MEI_LONG_DURS = {"breve": 2.0, "long": 4.0, "maxima": 8.0}
 
 
 def _keysig_alters(sig: str | None) -> dict:
@@ -77,9 +79,12 @@ def _note_value(note, parents: dict, ppq: float) -> float | None:
         return float(dur_ppq) / (4.0 * ppq)
 
     dur = holder.get("dur")
-    if dur is None or not dur.isdigit():
+    if dur in MEI_LONG_DURS:
+        value = MEI_LONG_DURS[dur]
+    elif dur is None or not dur.isdigit():
         return None
-    value = 1.0 / int(dur)
+    else:
+        value = 1.0 / int(dur)
     dots = int(holder.get("dots", 0))
     if dots:
         value *= 2.0 - 0.5**dots
@@ -203,7 +208,9 @@ def kern_bags(path: Path) -> tuple[dict, dict]:
                 dur_m = re.match(r"\D*(\d+)", sub)
                 if not dur_m:
                     continue
-                value = 1.0 / int(dur_m.group(1))
+                digits = dur_m.group(1)
+                # 0 is a breve, 00 a long: two and four whole notes
+                value = 1.0 / int(digits) if int(digits) else 2.0 ** len(digits)
                 dots = sub.count(".")
                 if dots:
                     value *= 2.0 - 0.5**dots

@@ -41,3 +41,19 @@ def test_wrong_and_extra_notes_cost_recall_and_precision(tmp_path: Path):
     assert scores["pitch"] == 100.0 * (n - 1) / n  # recall: one note missed
     assert scores["precision"] == 100.0 * (n - 1) / (n + 1)  # two notes out are wrong
     assert scores["ratio"] == (n + 1) / n
+
+
+def test_breves_and_longs_score_as_two_and_four_whole_notes(tmp_path: Path):
+    mei = tmp_path / "long.mei"
+    mei.write_text(
+        '<mei xmlns="http://www.music-encoding.org/ns/mei"><music><body><mdiv><score>'
+        '<scoreDef><staffGrp><staffDef n="1" lines="5" clef.shape="G" clef.line="2"/></staffGrp></scoreDef>'
+        '<section><measure n="1"><staff n="1"><layer n="1">'
+        '<note pname="c" oct="4" dur="breve"/><note pname="d" oct="4" dur="long"/>'
+        "</layer></staff></measure></section></score></mdiv></body></music></mei>"
+    )
+    krn = tmp_path / "long.krn"
+    krn.write_text("**kern\n*staff1\n*clefG2\n=1\n0c\n00d\n*-\n")
+    scores = score_kern(mei, krn)
+    assert scores["notes"] == 2
+    assert scores["pitch"] == scores["rhythm"] == 100.0
