@@ -282,6 +282,7 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
             elements=[
                 Element("fg", ("fing",), (20, 20, 45, 50), text="2"),
                 Element("mrd", ("mordent",), (120, 120, 160, 150)),
+                Element("sys", ("system-staff",), (0, 60, 200, 100)),  # staff space 10
             ],
             glyphs=[],
         )
@@ -304,7 +305,11 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
         for split in ("train", "val", "test"):
             assert data[f"s_{split}"].shape == data[f"y_{split}"].shape
             assert (data[f"w_{split}"] == -1).all()
+            assert data[f"c_{split}"].shape == (len(data[f"y_{split}"]), 9)
             assert set(data[f"s_{split}"].tolist()) <= {SOURCE_CROP}
+        # the surviving crop has a real context: centre 4.5 spaces above the middle line
+        c = data["c_test"]
+        assert c.shape[0] == 1 and c[0, 0] == 1.0 and abs(c[0, 1] - (-4.5 / 6)) < 1e-6
     assert load_symbol_sources(out, "test").tolist() == [SOURCE_CROP]
     meta = json.loads((out / "labels.json").read_text())
     assert meta["source_names"] == ["font", "stroke", "crop", "hand"]
@@ -404,3 +409,130 @@ def test_homus_reader_rendering_and_writer_split(tmp_path: Path):
     records = json.loads((out / "strokes_test.json").read_text())
     assert len(records) == 2 and {"writer", "label", "fraction", "strokes"} <= set(records[0])
     assert (out / "strokes_val.json").is_file() and not (out / "strokes_train.json").exists()
+
+
+def test_context_vector_and_page_geometry():
+    from musicset.context import (
+        CONTEXT_DIM,
+        PageGeometry,
+        SymbolContext,
+        context_from_record,
+        context_vector,
+    )
+
+    assert context_vector(None).tolist() == [0.0] * CONTEXT_DIM
+    page = PageAnnotation(
+        score="s",
+        page=1,
+        width=1000.0,
+        height=400.0,
+        pixel_width=1000.0,
+        pixel_height=400.0,
+        elements=[
+            Element("sys", ("system-staff",), (0, 100, 1000, 180)),  # staff space 20, middle 140
+            Element("m", ("measure",), (0, 50, 500, 250)),
+        ],
+        glyphs=[Glyph("E0A4", (300, 130, 320, 150), owner="n")],  # notehead centred (310, 140)
+    )
+    geo = PageGeometry(page)
+    ctx = geo.context((330, 100, 340, 110))  # 10x10 box centred (335, 105)
+    assert ctx is not None
+    assert abs(ctx.y_staff - (-1.75)) < 1e-9
+    assert abs(ctx.x_measure - 0.67) < 1e-9
+    assert abs(ctx.barline - 8.25) < 1e-9
+    assert ctx.note_dx is not None and abs(ctx.note_dx - 1.25) < 1e-9
+    assert ctx.note_dy is not None and abs(ctx.note_dy - (-1.75)) < 1e-9
+    assert abs(ctx.width - 0.5) < 1e-9 and abs(ctx.height - 0.5) < 1e-9
+    v = context_vector(ctx)
+    assert v.shape == (CONTEXT_DIM,) and v.dtype == np.float32
+    assert abs(v[0] - 1.0) < 1e-6 and abs(v[1] - (-1.75 / 6)) < 1e-6
+    assert abs(v[2] - 0.34) < 1e-6 and abs(v[3] - 1.0) < 1e-6  # barline clipped at 8
+    assert v[4] == 1.0 and abs(v[5] - 1.25 / 8) < 1e-6 and abs(v[6] - (-1.75 / 8)) < 1e-6
+    # far from any notehead and outside every measure
+    far = geo.context((800, 300, 820, 320))
+    assert far is not None and far.note_dx is None and far.x_measure == 0.5
+    assert context_vector(far)[4] == 0.0
+    # a box whose own notehead must not count as its neighbour
+    own = geo.context((300, 130, 320, 150))
+    assert own is not None and own.note_dx is None
+    # no staff on the page: unknown
+    empty = PageAnnotation(
+        score="e", page=1, width=10.0, height=10.0, pixel_width=10.0, pixel_height=10.0
+    )
+    assert PageGeometry(empty).context((1, 1, 2, 2)) is None
+    # contributed record
+    rec = {
+        "context": {
+            "y_staff": -2.0,
+            "x_measure": 0.1,
+            "barline": 1.0,
+            "note_dx": None,
+            "note_dy": None,
+        }
+    }
+    got = context_from_record(rec, (0, 0, 30, 15), 10.0)
+    assert got == SymbolContext(-2.0, 0.1, 1.0, None, None, 3.0, 1.5)
+    assert context_from_record({}, (0, 0, 1, 1), 10.0) is None
+
+
+def test_stroke_contributions_with_context(tmp_path: Path):
+    from musicset.strokes import load_stroke_contributions
+
+    f = tmp_path / "battuta.jsonl"
+    f.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in (
+                {
+                    "label": "noteQuarter",
+                    "writer": "alice",
+                    "staff_space": 10.0,
+                    "strokes": [[[0, 0, 1, 0.5], [5, 35, 20, 0.6]]],
+                    "context": {
+                        "y_staff": 1.0,
+                        "x_measure": 0.3,
+                        "barline": 2.0,
+                        "note_dx": 2.5,
+                        "note_dy": 0.0,
+                    },
+                },
+                {
+                    "label": "noteQuarter",
+                    "writer": "bob",
+                    "staff_space": 10.0,
+                    "strokes": [[[0, 0], [4, 30]]],
+                },
+                {
+                    "label": "not-a-class",
+                    "writer": "bob",
+                    "staff_space": 10.0,
+                    "strokes": [[[0, 0], [1, 1]]],
+                },
+            )
+        )
+        + "\n"
+    )
+    samples = load_stroke_contributions(f, classes={"noteQuarter"})
+    assert [s.writer for s in samples] == [1000, 1001]
+    assert samples[0].context is not None and samples[0].context.note_dx == 2.5
+    assert samples[0].fraction == 35 / (8.8 * 10)
+    assert samples[1].context is None
+    out = tmp_path / "out"
+    report = build_symbol_dataset(
+        out,
+        samples_per_class=0,
+        strokes=[f],
+        groups=("note",),
+        split=(0.5, 0.0, 0.5),
+        min_ink=1,
+        write_png=False,
+    )
+    assert report.source_counts["train"]["hand"] + report.source_counts["test"]["hand"] == 2
+    with np.load(out / "dataset.npz") as data:
+        c = np.concatenate([data["c_train"], data["c_test"]])
+        w = np.concatenate([data["w_train"], data["w_test"]])
+        assert set(w.tolist()) == {1000, 1001}
+        assert c[w == 1000][0, 0] == 1.0 and c[w == 1000][0, 4] == 1.0  # alice's real context
+        assert (c[w == 1001] == 0).all()  # bob's unknown (no crop pool to draw from)
+    meta = json.loads((out / "labels.json").read_text())
+    assert meta["context_features"][0] == "valid" and meta["strokes"] == [str(f)]

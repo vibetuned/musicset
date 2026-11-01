@@ -349,10 +349,27 @@ Writes both `dataset.npz` (`x_train`, `y_train`, `s_train`, `x_val`, ...,
 records the build settings and per-split counts.
 
 `s_<split>` holds each sample's source (`0` font glyph, `1` stylus stroke
-template, `2` score crop, `3` real pen strokes from HOMUS), so a classifier can
-report stylus and real-crop accuracy separately. HOMUS val/test samples are
-rendered once, deterministically, at their natural size, and their raw strokes
-are kept in `strokes_val.json` / `strokes_test.json` for stroke-level tests. Synthetic samples are split per class at random; score
+template, `2` score crop, `3` real pen strokes from HOMUS or an editor), so a
+classifier can report stylus and real-crop accuracy separately; `w_<split>` the
+writer id of pen samples (`-1` otherwise). HOMUS val/test samples are rendered
+once, deterministically, at their natural size, and their raw strokes are kept
+in `strokes_val.json` / `strokes_test.json` for stroke-level tests.
+
+`c_<split>` is the **conditioning vector** (`musicset.context`): where the
+symbol sits in the score, in staff spaces, so the same pen mark can be read
+differently in different places (a dot beside a notehead is an augmentation
+dot, above it a staccato). Score crops carry their real context from the page
+geometry (`system-staff` lines, measures, neighbouring noteheads), editor
+contributions the one their editor recorded, and every other sample, with
+probability `--context-p`, one drawn from the real contexts of training crops
+of its class, else "unknown" (all zeros). `labels.json` lists the feature names
+and which classes have a context pool.
+
+Editor contributions (`--strokes`, see `musicset.strokes`) are JSON Lines with
+`label`, an opaque `writer`, the editor's `staff_space` (pixels between two
+staff lines, which fixes the drawing's natural size), the `strokes`, and
+optionally a `context` dict with `y_staff`, `x_measure`, `barline`, `note_dx`,
+`note_dy` in staff spaces. Contributors never straddle splits. Synthetic samples are split per class at random; score
 crops are split **by score**, never straddling splits. Patches with fewer than
 `--min-ink` ink pixels are dropped, and a byte-identical image is kept in one
 split only (`--no-dedup` to disable), since identical engravings of e.g. a

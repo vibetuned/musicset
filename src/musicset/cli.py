@@ -381,8 +381,10 @@ def cmd_symbols(args: argparse.Namespace) -> None:
         from_dataset=args.from_dataset,
         max_crops_per_class=args.max_crops_per_class,
         homus=args.homus,
+        strokes=args.strokes,
         homus_copies=args.homus_copies,
         homus_brush=args.homus_brush,
+        context_p=args.context_p,
         groups=tuple(args.groups) if args.groups else SYMBOL_GROUPS,
         size=args.size,
         preset=args.preset,
@@ -622,10 +624,23 @@ def main(argv: list[str] | None = None) -> None:
         help="HOMUS.zip or its extracted directory: real pen strokes, split by writer",
     )
     p.add_argument(
+        "--strokes",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="contributed pen strokes (JSON Lines from a score editor), split by contributor",
+    )
+    p.add_argument(
         "--homus-copies",
         type=int,
         default=1,
         help="augmented renderings of each HOMUS training sample",
+    )
+    p.add_argument(
+        "--context-p",
+        type=float,
+        default=0.7,
+        help="share of synthetic and HOMUS samples given a context drawn from real crops",
     )
     p.add_argument(
         "--homus-brush",

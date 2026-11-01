@@ -51,9 +51,17 @@ from svgpathtools import parse_path
 from musicset.annotate.geometry import BBox
 from musicset.annotate.schema import PageAnnotation
 from musicset.annotate.smufl import available_fonts, verovio_data_dir
-from musicset.homus import Stroke, load_homus, stroke_fraction
+from musicset.context import (
+    CONTEXT_DIM,
+    CONTEXT_FEATURES,
+    PageGeometry,
+    SymbolContext,
+    context_vector,
+)
+from musicset.homus import Stroke, StrokeSample, load_homus, stroke_fraction
 from musicset.parallel import map_pool
 from musicset.pipeline import PAGE_SUFFIX, page_file_stem
+from musicset.strokes import load_stroke_contributions
 
 SYMBOL_GROUPS = (
     "fingering",
@@ -957,15 +965,19 @@ def _render_task(task: tuple[str, int, str, float, bool, int, int, int]) -> tupl
     )
 
 
-def _render_homus_task(
-    task: tuple[tuple[Stroke, ...], int, float, bool, int, int, int, bool, float],
+def _sample_fraction(sample: StrokeSample) -> float:
+    """Canvas fraction of a pen sample: its own (from a staff space) or HOMUS's size rule."""
+    return sample.fraction if sample.fraction is not None else stroke_fraction(sample.strokes)
+
+
+def _render_hand_task(
+    task: tuple[tuple[Stroke, ...], float, int, float, bool, int, int, int, bool, float],
 ) -> np.ndarray:
-    """One HOMUS sample: augmented at its jittered natural size for ``train`` (pen
-    0.05-0.13 wide, a pressure brush with probability ``brush_p``), else
-    deterministic the way an editor would send it."""
-    strokes, size, strength, invert, seed, j, k, train, brush_p = task
+    """One real pen sample (HOMUS or contributed): augmented at its jittered natural
+    size for ``train`` (pen 0.05-0.13 wide, a pressure brush with probability
+    ``brush_p``), else deterministic the way an editor would send it."""
+    strokes, fraction, size, strength, invert, seed, j, k, train, brush_p = task
     rng = np.random.default_rng([seed, 3, j, k])
-    fraction = stroke_fraction(strokes)
     if train:
         return render_strokes_sample(
             strokes,
@@ -1134,9 +1146,24 @@ def page_symbol_boxes(
     allowed: set[str] | None = None,
 ) -> list[tuple[str, BBox]]:
     """``(class_name, pixel_bbox)`` pairs of every target symbol on a canonical page."""
+    return [
+        (cls, box)
+        for cls, box, _ in page_symbol_boxes_with_context(page, image_size, allowed=allowed)
+    ]
+
+
+def page_symbol_boxes_with_context(
+    page: PageAnnotation,
+    image_size: tuple[int, int],
+    *,
+    allowed: set[str] | None = None,
+) -> list[tuple[str, BBox, SymbolContext | None]]:
+    """``(class_name, pixel_bbox, context)`` of every target symbol on a canonical page;
+    the context (:mod:`musicset.context`) is computed from the page-unit box."""
     width, height = image_size
+    geometry = PageGeometry(page)
     sx, sy = width / page.width, height / page.height
-    out: list[tuple[str, BBox]] = []
+    out: list[tuple[str, BBox, SymbolContext | None]] = []
 
     def to_px(b: BBox) -> BBox | None:
         x1, y1 = max(0.0, min(float(width), b[0] * sx)), max(0.0, min(float(height), b[1] * sy))
@@ -1165,7 +1192,7 @@ def page_symbol_boxes(
         if cls is not None and (allowed is None or cls in allowed):
             px_box = to_px(el.bbox)
             if px_box is not None:
-                out.append((cls, px_box))
+                out.append((cls, px_box, geometry.context(el.bbox)))
                 covered_elements.add(idx)
 
     # Glyphs: articulations, accidentals (outside key signatures), dynamics, and
@@ -1180,7 +1207,7 @@ def page_symbol_boxes(
             continue
         px_box = to_px(glyph.bbox)
         if px_box is not None:
-            out.append((cls, px_box))
+            out.append((cls, px_box, geometry.context(glyph.bbox)))
 
     return out
 
@@ -1203,13 +1230,20 @@ def extract_page_symbols(
         arr = np.asarray(image)
         grey = arr.mean(axis=2).round().astype(np.uint8) if arr.ndim == 3 else arr.astype(np.uint8)
 
+    return [(cls, patch) for cls, patch, _ in _page_crops(page, grey, groups, size, invert)]
+
+
+def _page_crops(
+    page: PageAnnotation, grey: np.ndarray, groups: Sequence[str], size: int, invert: bool
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
+    """``(class, patch, context vector)`` crops of one page."""
     h, w = grey.shape[:2]
     allowed = {s.name for s in symbol_specs(groups)}
-    crops: list[tuple[str, np.ndarray]] = []
-    for cls, bbox in page_symbol_boxes(page, (w, h), allowed=allowed):
+    crops: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for cls, bbox, ctx in page_symbol_boxes_with_context(page, (w, h), allowed=allowed):
         patch = _crop_box_to_patch(grey, bbox, size, invert=invert)
         if patch is not None:
-            crops.append((cls, patch))
+            crops.append((cls, patch, context_vector(ctx)))
     return crops
 
 
@@ -1238,28 +1272,29 @@ def _score_of_stem(stem: str) -> str:
 
 def _extract_page_task(
     task: tuple[Path, Path, tuple[str, ...], int, bool],
-) -> list[tuple[str, np.ndarray, str]]:
-    """``(class, patch, score)`` crops of one canonical ``pages/`` page."""
+) -> list[tuple[str, np.ndarray, str, np.ndarray]]:
+    """``(class, patch, score, context)`` crops of one canonical ``pages/`` page."""
     page_path, img_path, groups, size, invert = task
     page = PageAnnotation.load(page_path)
+    with Image.open(img_path) as im:
+        grey = np.asarray(im.convert("L"), dtype=np.uint8)
     return [
-        (cls, patch, page.score)
-        for cls, patch in extract_page_symbols(
-            page, img_path, groups=groups, size=size, invert=invert
-        )
+        (cls, patch, page.score, ctx)
+        for cls, patch, ctx in _page_crops(page, grey, groups, size, invert)
     ]
 
 
 def _extract_annotation_task(
     task: tuple[Path, Path, dict[str, str], frozenset[str], int, bool],
-) -> list[tuple[str, np.ndarray, str]]:
-    """``(class, patch, score)`` crops of one ``annotations/*.json`` page."""
+) -> list[tuple[str, np.ndarray, str, np.ndarray]]:
+    """``(class, patch, score, context)`` crops of one ``annotations/*.json`` page; the
+    detection view has no staff geometry, so the context is unknown (zeros)."""
     ann_path, img_path, fing_ids, allowed, size, invert = task
     record = json.loads(ann_path.read_text(encoding="utf-8"))
     with Image.open(img_path) as im:
         grey = np.asarray(im.convert("L"), dtype=np.uint8)
     score = _score_of_stem(ann_path.stem)
-    crops: list[tuple[str, np.ndarray, str]] = []
+    crops: list[tuple[str, np.ndarray, str, np.ndarray]] = []
     for ann in record.get("annotations", []):
         cls = ann.get("class", "")
         if cls == "fing":
@@ -1272,7 +1307,7 @@ def _extract_annotation_task(
             continue
         patch = _crop_box_to_patch(grey, ann["bbox"], size, invert=invert)
         if patch is not None:
-            crops.append((cls, patch, score))
+            crops.append((cls, patch, score, context_vector(None)))
     return crops
 
 
@@ -1285,7 +1320,7 @@ def _extract_dataset_symbols(
     max_per_class: int = 0,
     seed: int = 0,
     workers: int | None = 1,
-) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray, np.ndarray]:
     roots = [dataset] if isinstance(dataset, Path) else list(dataset)
     specs = symbol_specs(groups)
     class_names = tuple(s.name for s in specs)
@@ -1312,26 +1347,30 @@ def _extract_dataset_symbols(
                 if img_path.exists():
                     ann_tasks.append((ann_path, img_path, fing_ids, allowed, size, invert))
 
-    by_class: dict[int, list[tuple[np.ndarray, str]]] = {i: [] for i in range(len(class_names))}
+    by_class: dict[int, list[tuple[np.ndarray, str, np.ndarray]]] = {
+        i: [] for i in range(len(class_names))
+    }
     for crops in _run_tasks(_extract_page_task, page_tasks, workers, 8):
-        for cls, patch, score in crops:
-            by_class[class_to_idx[cls]].append((patch, score))
+        for cls, patch, score, ctx in crops:
+            by_class[class_to_idx[cls]].append((patch, score, ctx))
     for crops in _run_tasks(_extract_annotation_task, ann_tasks, workers, 8):
-        for cls, patch, score in crops:
-            by_class[class_to_idx[cls]].append((patch, score))
+        for cls, patch, score, ctx in crops:
+            by_class[class_to_idx[cls]].append((patch, score, ctx))
 
     rng = np.random.default_rng(seed)
     images_list: list[np.ndarray] = []
     labels_list: list[int] = []
     scores_list: list[str] = []
+    contexts_list: list[np.ndarray] = []
     for cls_idx, patches in by_class.items():
         if not patches:
             continue
         if max_per_class > 0 and len(patches) > max_per_class:
             order = rng.permutation(len(patches))[:max_per_class]
             patches = [patches[int(i)] for i in order]
-        images_list.extend(p for p, _ in patches)
-        scores_list.extend(sc for _, sc in patches)
+        images_list.extend(p for p, _, _ in patches)
+        scores_list.extend(sc for _, sc, _ in patches)
+        contexts_list.extend(c for _, _, c in patches)
         labels_list.extend([cls_idx] * len(patches))
 
     if not images_list:
@@ -1340,12 +1379,14 @@ def _extract_dataset_symbols(
             np.empty(0, dtype=np.int64),
             class_names,
             np.empty(0, dtype=str),
+            np.empty((0, CONTEXT_DIM), dtype=np.float32),
         )
     return (
         np.stack(images_list, axis=0),
         np.array(labels_list, dtype=np.int64),
         class_names,
         np.array(scores_list, dtype=str),
+        np.stack(contexts_list, axis=0).astype(np.float32),
     )
 
 
@@ -1366,7 +1407,7 @@ def extract_dataset_symbols(
     ``workers`` (``1``: inline, ``None``: musicset's default pool) only changes
     the speed.
     """
-    images, labels, class_names, _ = _extract_dataset_symbols(
+    images, labels, class_names, _, _ = _extract_dataset_symbols(
         dataset,
         groups=groups,
         size=size,
@@ -1390,7 +1431,7 @@ def extract_dataset_symbols_with_scores(
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
     """:func:`extract_dataset_symbols` plus the score name each crop came from,
     the grouping key of the train/val/test split."""
-    return _extract_dataset_symbols(
+    images, labels, class_names, scores, _ = _extract_dataset_symbols(
         dataset,
         groups=groups,
         size=size,
@@ -1399,6 +1440,7 @@ def extract_dataset_symbols_with_scores(
         seed=seed,
         workers=workers,
     )
+    return images, labels, class_names, scores
 
 
 # =============================================================================
@@ -1479,7 +1521,29 @@ def _group_split_indices(
     }
 
 
+def _fill_contexts(
+    contexts: np.ndarray,
+    labels: np.ndarray,
+    fill: np.ndarray,
+    pools: dict[int, np.ndarray],
+    p: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Give the ``fill`` rows a context drawn from ``pools[label]`` with probability ``p``."""
+    out = contexts.copy()
+    for cls_idx in np.unique(labels[fill]).tolist():
+        pool = pools.get(cls_idx)
+        if pool is None:
+            continue
+        rows = np.flatnonzero(fill & (labels == cls_idx))
+        chosen = rows[rng.random(len(rows)) < p]
+        out[chosen] = pool[rng.integers(len(pool), size=len(chosen))]
+    return out
+
+
 def _ink_pixels(images: np.ndarray, invert: bool) -> np.ndarray:
+    if len(images) == 0:
+        return np.zeros(0, dtype=np.int64)
     ink = images > 127 if invert else images < 128
     return ink.reshape(len(images), -1).sum(axis=1)
 
@@ -1495,8 +1559,10 @@ def build_symbol_dataset(
     from_dataset: Path | Sequence[Path] | None = None,
     max_crops_per_class: int = 0,
     homus: Path | None = None,
+    strokes: Sequence[Path] = (),
     homus_copies: int = 1,
     homus_brush: float = 0.0,
+    context_p: float = 0.7,
     groups: Sequence[str] = SYMBOL_GROUPS,
     size: int = 32,
     preset: str = "mixed",
@@ -1524,10 +1590,17 @@ def build_symbol_dataset(
     over ``val`` over ``train``), since identical engravings recur across pages
     and scores.
 
+    Every sample gets a conditioning vector (:mod:`musicset.context`,
+    ``c_<split>``): score crops their real one, contributed strokes the one
+    their editor recorded, and every other sample, with probability
+    ``context_p``, one drawn from the real contexts of training crops of its
+    class (else "unknown", all zeros), so the classifier learns where each
+    symbol lives without ever needing the context.
+
     Writes:
     * ``out/dataset.npz`` (``x_<split>``, ``y_<split>``, ``s_<split>`` source
-      codes indexing ``SOURCE_NAMES``, ``w_<split>`` HOMUS writer ids (``-1``
-      for other sources), ``classes``);
+      codes indexing ``SOURCE_NAMES``, ``w_<split>`` writer ids (``-1`` for
+      synthetic and crops), ``c_<split>`` context vectors, ``classes``);
     * ``out/labels.json`` (class list, index map, group map, build settings,
       per-class, per-split and per-source counts, removed samples);
     * ``out/strokes_<split>.json`` for HOMUS val/test samples;
@@ -1535,15 +1608,17 @@ def build_symbol_dataset(
     """
     if samples_per_class < 0:
         raise ValueError("samples_per_class must be >= 0")
-    if samples_per_class == 0 and not from_dataset and homus is None:
-        raise ValueError("need samples_per_class > 0, from_dataset or homus")
+    if samples_per_class == 0 and not from_dataset and homus is None and not strokes:
+        raise ValueError("need samples_per_class > 0, from_dataset, homus or strokes")
 
     specs = symbol_specs(groups)
     class_names = tuple(s.name for s in specs)
     class_to_idx = {name: i for i, name in enumerate(class_names)}
     rng = np.random.default_rng(seed)
     removed = {"blank": 0, "duplicate": 0}
-    pieces: dict[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = {
+    pieces: dict[
+        str, list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
+    ] = {
         "train": [],
         "val": [],
         "test": [],
@@ -1551,13 +1626,18 @@ def build_symbol_dataset(
     crop_scores: dict[str, int] = {}
     homus_writers: dict[str, int] = {}
     stroke_records: dict[str, list[dict[str, Any]]] = {}
+    hand_piece_index: dict[str, int] = {}
 
-    def keep_inked(
-        x: np.ndarray, y: np.ndarray, s: np.ndarray, g: np.ndarray | None = None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    def inked_mask(x: np.ndarray) -> np.ndarray:
         inked = _ink_pixels(x, invert) >= min_ink
         removed["blank"] += int((~inked).sum())
-        return x[inked], y[inked], s[inked], (None if g is None else g[inked])
+        return inked
+
+    def no_writer(n: int) -> np.ndarray:
+        return np.full(n, -1, dtype=np.int32)
+
+    def unknown_context(n: int) -> np.ndarray:
+        return np.zeros((n, CONTEXT_DIM), dtype=np.float32)
 
     if samples_per_class > 0:
         sx, sy, _, ss = _generate_symbol_samples(
@@ -1570,12 +1650,16 @@ def build_symbol_dataset(
             seed=seed,
             workers=workers,
         )
-        sx, sy, ss, _ = keep_inked(sx, sy, ss)
+        m = inked_mask(sx)
+        sx, sy, ss = sx[m], sy[m], ss[m]
         for name, idx in _stratified_split_indices(sy, split, rng).items():
-            pieces[name].append((sx[idx], sy[idx], ss[idx], np.full(len(idx), -1, np.int32)))
+            n = len(idx)
+            pieces[name].append(
+                (sx[idx], sy[idx], ss[idx], no_writer(n), unknown_context(n), np.ones(n, bool))
+            )
 
     if from_dataset:
-        cx, cy, _, cg = _extract_dataset_symbols(
+        cx, cy, _, cg, cc = _extract_dataset_symbols(
             from_dataset,
             groups=groups,
             size=size,
@@ -1585,15 +1669,23 @@ def build_symbol_dataset(
             workers=workers,
         )
         cs = np.full(len(cy), SOURCE_CROP, dtype=np.uint8)
-        cx, cy, cs, cg_kept = keep_inked(cx, cy, cs, cg)
-        if len(cx) and cg_kept is not None:
-            idx = _group_split_indices(cg_kept, split, rng)
-            crop_scores = {name: len(np.unique(cg_kept[i])) for name, i in idx.items()}
+        m = inked_mask(cx)
+        cx, cy, cs, cg, cc = cx[m], cy[m], cs[m], cg[m], cc[m]
+        if len(cx):
+            idx = _group_split_indices(cg, split, rng)
+            crop_scores = {name: len(np.unique(cg[i])) for name, i in idx.items()}
             for name, i in idx.items():
-                pieces[name].append((cx[i], cy[i], cs[i], np.full(len(i), -1, np.int32)))
+                pieces[name].append(
+                    (cx[i], cy[i], cs[i], no_writer(len(i)), cc[i], np.zeros(len(i), bool))
+                )
 
+    hand: list[StrokeSample] = []
     if homus is not None:
-        samples = [smp for smp in load_homus(homus) if smp.label in class_to_idx]
+        hand += [smp for smp in load_homus(homus) if smp.label in class_to_idx]
+    if strokes:
+        hand += load_stroke_contributions(list(strokes), classes=set(class_to_idx))
+    if hand:
+        samples = hand
         if samples:
             writers = np.array([str(smp.writer) for smp in samples])
             idx = _group_split_indices(writers, split, rng)
@@ -1604,6 +1696,7 @@ def build_symbol_dataset(
                 tasks = [
                     (
                         samples[j].strokes,
+                        _sample_fraction(samples[j]),
                         size,
                         strength,
                         invert,
@@ -1621,40 +1714,73 @@ def build_symbol_dataset(
                     [class_to_idx[samples[j].label] for j in i.tolist() for _ in range(copies)],
                     dtype=np.int64,
                 )
-                for n, image in enumerate(_run_tasks(_render_homus_task, tasks, workers, 64)):
+                for n, image in enumerate(_run_tasks(_render_hand_task, tasks, workers, 64)):
                     hx[n] = image
                 hs = np.full(len(hy), SOURCE_HAND, dtype=np.uint8)
-                hw = np.array(
-                    [samples[j].writer for j in i.tolist() for _ in range(copies)], dtype=np.int32
+                order_j = [j for j in i.tolist() for _ in range(copies)]
+                hw = np.array([samples[j].writer for j in order_j], dtype=np.int32)
+                hc = (
+                    np.stack([context_vector(samples[j].context) for j in order_j]).astype(
+                        np.float32
+                    )
+                    if order_j
+                    else unknown_context(0)
                 )
-                hx, hy, hs, hw_kept = keep_inked(hx, hy, hs, hw)
-                assert hw_kept is not None
-                pieces[name].append((hx, hy, hs, hw_kept))
+                hfill = np.array([samples[j].context is None for j in order_j], dtype=bool)
+                m = inked_mask(hx)
+                hand_piece_index[name] = len(pieces[name])
+                pieces[name].append((hx[m], hy[m], hs[m], hw[m], hc[m], hfill[m]))
                 if not train:
+                    kept = [j for j, ok in zip(order_j, m.tolist(), strict=True) if ok]
                     stroke_records[name] = [
                         {
                             "writer": samples[j].writer,
                             "label": samples[j].label,
-                            "fraction": stroke_fraction(samples[j].strokes),
+                            "fraction": _sample_fraction(samples[j]),
                             "strokes": [[list(p) for p in stroke] for stroke in samples[j].strokes],
                         }
-                        for j in i.tolist()
+                        for j in kept
                     ]
 
-    splits: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    # Contexts for samples without a real one: drawn from the training crops of their class
+    pools: dict[int, np.ndarray] = {}
+    for _, py, _, _, pc, pfill in pieces["train"]:
+        real = ~pfill & (pc[:, 0] > 0)
+        for cls_idx in np.unique(py[real]).tolist():
+            rows = pc[real & (py == cls_idx)]
+            pools[cls_idx] = np.concatenate([pools[cls_idx], rows]) if cls_idx in pools else rows
+    pools = {k: v for k, v in pools.items() if len(v) >= 10}
+    for parts in pieces.values():
+        for n_, (px, py, ps, pw, pc, pfill) in enumerate(parts):
+            if pfill.any():
+                parts[n_] = (
+                    px,
+                    py,
+                    ps,
+                    pw,
+                    _fill_contexts(pc, py, pfill, pools, context_p, rng),
+                    pfill,
+                )
+    for name, records in stroke_records.items():
+        piece_c = pieces[name][hand_piece_index[name]][4]
+        for record, ctx in zip(records, piece_c, strict=True):
+            record["context"] = [round(float(v), 4) for v in ctx]
+
+    splits: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     for name in ("train", "val", "test"):
         parts = pieces[name]
         x = np.concatenate([p[0] for p in parts]) if parts else np.empty((0, size, size), np.uint8)
         y = np.concatenate([p[1] for p in parts]) if parts else np.empty(0, dtype=np.int64)
         s = np.concatenate([p[2] for p in parts]) if parts else np.empty(0, dtype=np.uint8)
         w = np.concatenate([p[3] for p in parts]) if parts else np.empty(0, dtype=np.int32)
+        c = np.concatenate([p[4] for p in parts]) if parts else unknown_context(0)
         order = rng.permutation(len(y))
-        splits[name] = (x[order], y[order], s[order], w[order])
+        splits[name] = (x[order], y[order], s[order], w[order], c[order])
 
     if dedup:
         seen: set[bytes] = set()
         for name in ("test", "val", "train"):
-            x, y, s, w = splits[name]
+            x, y, s, w, c = splits[name]
             keep = np.ones(len(y), dtype=bool)
             for i, h in enumerate(_image_hashes(x)):
                 if h in seen:
@@ -1662,7 +1788,7 @@ def build_symbol_dataset(
                 else:
                     seen.add(h)
             removed["duplicate"] += int((~keep).sum())
-            splits[name] = (x[keep], y[keep], s[keep], w[keep])
+            splits[name] = (x[keep], y[keep], s[keep], w[keep], c[keep])
 
     out.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -1671,21 +1797,24 @@ def build_symbol_dataset(
         y_train=splits["train"][1],
         s_train=splits["train"][2],
         w_train=splits["train"][3],
+        c_train=splits["train"][4],
         x_val=splits["val"][0],
         y_val=splits["val"][1],
         s_val=splits["val"][2],
         w_val=splits["val"][3],
+        c_val=splits["val"][4],
         x_test=splits["test"][0],
         y_test=splits["test"][1],
         s_test=splits["test"][2],
         w_test=splits["test"][3],
+        c_test=splits["test"][4],
         classes=np.array(class_names),
     )
     for name, records in stroke_records.items():
         (out / f"strokes_{name}.json").write_text(json.dumps(records), encoding="utf-8")
 
     if write_png:
-        for split_name, (xs_, ys_, _, _) in splits.items():
+        for split_name, (xs_, ys_, _, _, _) in splits.items():
             if not len(xs_):
                 continue
             split_dir = out / split_name
@@ -1724,6 +1853,7 @@ def build_symbol_dataset(
         "from_dataset": [str(p) for p in roots],
         "max_crops_per_class": max_crops_per_class,
         "homus": None if homus is None else str(homus),
+        "strokes": [str(p) for p in strokes],
         "homus_copies": homus_copies,
         "homus_brush": homus_brush,
         "split": list(split),
@@ -1736,6 +1866,10 @@ def build_symbol_dataset(
         "source_counts": source_counts,
         "crop_scores": crop_scores,
         "homus_writers": homus_writers,
+        "context_features": list(CONTEXT_FEATURES),
+        "context_p": context_p,
+        "context_pools": {class_names[k]: len(v) for k, v in sorted(pools.items())},
+        "context_counts": {k: int((v[4][:, 0] > 0).sum()) for k, v in splits.items()},
         "removed": removed,
     }
     (out / "labels.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")

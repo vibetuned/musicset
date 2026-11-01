@@ -19,6 +19,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from musicset.context import SymbolContext
+
 Point = tuple[float, float]
 Stroke = tuple[Point, ...]
 
@@ -61,6 +63,16 @@ HOMUS_CLASSES: dict[str, str] = {
 HOMUS_CANVAS = 150.0
 """Pen units that fill the symbol canvas: a G clef (~127 units) spans ~85% of it."""
 
+CANVAS_STAFF_SPACES = 8.8
+"""Staff spaces that fill the symbol canvas, the same size rule in score units.
+
+HOMUS writers drew at natural proportions: a whole note spans ~24 pen units, a
+quarter note ~55, a sharp ~52, a G clef ~127, i.e. one staff space is ~17 pen
+units, so the 150-unit canvas is ~8.8 staff spaces. An editor that knows its
+staff space (pixels between two staff lines) uses
+:func:`stroke_fraction_from_staff_space` and lands on the same scale.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class StrokeSample:
@@ -70,6 +82,10 @@ class StrokeSample:
     strokes: tuple[Stroke, ...]
     source: str = ""
     """File the sample came from, for error messages."""
+    fraction: float | None = None
+    """Canvas fraction the drawing should span; ``None`` means ``stroke_fraction`` (HOMUS units)."""
+    context: SymbolContext | None = None
+    """Where in the score the mark was drawn, when the contributor's editor recorded it."""
 
 
 def parse_homus(text: str) -> tuple[str, tuple[Stroke, ...]]:
@@ -152,12 +168,27 @@ def stroke_fraction(
     return float(min(hi, max(lo, stroke_span(strokes) / canvas_units)))
 
 
+def stroke_fraction_from_staff_space(
+    strokes: Sequence[Sequence[Point]],
+    staff_space: float,
+    lo: float = 0.08,
+    hi: float = 0.90,
+) -> float:
+    """Canvas fraction for strokes drawn in a score editor whose staff space (distance
+    between two staff lines, in the strokes' units) is ``staff_space``."""
+    if staff_space <= 0:
+        raise ValueError(f"staff_space must be positive, got {staff_space}")
+    return float(min(hi, max(lo, stroke_span(strokes) / (CANVAS_STAFF_SPACES * staff_space))))
+
+
 __all__ = [
+    "CANVAS_STAFF_SPACES",
     "HOMUS_CANVAS",
     "HOMUS_CLASSES",
     "StrokeSample",
     "load_homus",
     "parse_homus",
     "stroke_fraction",
+    "stroke_fraction_from_staff_space",
     "stroke_span",
 ]
