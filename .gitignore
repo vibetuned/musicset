@@ -11,3 +11,4 @@ wheels/
 
 # Local example scores and builds (scripts/make_examples.py)
 examples/
+data/

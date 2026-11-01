@@ -370,6 +370,34 @@ def cmd_counterpoint_pool(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_symbols(args: argparse.Namespace) -> None:
+    from musicset.symbols import SYMBOL_GROUPS, build_symbol_dataset
+
+    if args.samples_per_class == 0 and not args.from_dataset:
+        raise SystemExit("need -n > 0 or --from-dataset")
+    report = build_symbol_dataset(
+        args.out,
+        samples_per_class=args.samples_per_class,
+        from_dataset=args.from_dataset,
+        max_crops_per_class=args.max_crops_per_class,
+        groups=tuple(args.groups) if args.groups else SYMBOL_GROUPS,
+        size=args.size,
+        preset=args.preset,
+        strength=args.strength,
+        invert=args.invert,
+        split=(args.split[0], args.split[1], args.split[2]),
+        write_png=not args.no_png,
+        seed=args.seed,
+    )
+    logger.info(
+        "wrote %d symbols (%d classes, splits=%s) into %s",
+        sum(report.splits.values()),
+        len(report.classes),
+        report.splits,
+        report.out,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--workers", type=int, default=None, help="default: $MUSICSET_WORKERS")
@@ -552,6 +580,62 @@ def main(argv: list[str] | None = None) -> None:
         help="directory of predicted **kern (<score>.krn) to compare in the Kern tab",
     )
     p.set_defaults(func=cmd_view)
+
+    p = sub.add_parser(
+        "symbols",
+        help="MNIST-like isolated symbol dataset (fingerings 1-5, ornaments, articulations, ...)",
+    )
+    p.add_argument("out", type=Path, help="output directory (dataset.npz, labels.json, train/...)")
+    p.add_argument(
+        "-n",
+        "--samples-per-class",
+        type=int,
+        default=200,
+        help="synthetic samples per class (0: extract from --from-dataset only)",
+    )
+    p.add_argument(
+        "--from-dataset",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="built dataset(s) to extract real page crops from",
+    )
+    p.add_argument(
+        "--max-crops-per-class",
+        type=int,
+        default=0,
+        help="at most N extracted crops per class (0: all)",
+    )
+    p.add_argument(
+        "--groups",
+        nargs="+",
+        choices=("fingering", "ornament", "articulation", "accidental", "dynamic", "pedal"),
+        help="symbol groups to include (default: all six)",
+    )
+    p.add_argument(
+        "--preset",
+        choices=("mixed", "tablet", "score", "clean"),
+        default="mixed",
+        help="synthetic style and augmentation preset",
+    )
+    p.add_argument("--strength", type=float, default=1.0, help="augmentation strength")
+    p.add_argument("--size", type=int, default=32, help="patch width and height in pixels")
+    p.add_argument(
+        "--invert",
+        action="store_true",
+        help="white ink on black background (classic MNIST); default is black on white",
+    )
+    p.add_argument(
+        "--split",
+        type=float,
+        nargs=3,
+        default=[0.8, 0.1, 0.1],
+        metavar=("TRAIN", "VAL", "TEST"),
+        help="train/val/test split fractions",
+    )
+    p.add_argument("--no-png", action="store_true", help="write dataset.npz and labels.json only")
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(func=cmd_symbols)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

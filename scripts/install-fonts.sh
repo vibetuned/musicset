@@ -16,7 +16,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FONT_DIR="${FONT_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fonts/musicset}"
+# Homebrew's cairo picks text fonts through CoreText, which never reads the XDG
+# fonts dir; ~/Library/Fonts is seen by both CoreText and fontconfig
+if [ "$(uname -s)" = Darwin ]; then
+    FONT_DIR="${FONT_DIR:-$HOME/Library/Fonts/musicset}"
+else
+    FONT_DIR="${FONT_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fonts/musicset}"
+fi
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
 
@@ -33,13 +39,16 @@ fi
 VEROVIO="https://raw.githubusercontent.com/rism-digital/verovio/$VEROVIO_TAG/fonts"
 PETALUMA="https://raw.githubusercontent.com/steinbergmedia/petaluma/petaluma-1.065/redist/otf"
 
-declare -A FONTS=(
-    [Bravura]="$VEROVIO/Bravura/Bravura.otf"
-    [Gootville]="$VEROVIO/Gootville/Gootville.otf"
-    [Leipzig]="$VEROVIO/Leipzig/Leipzig.ttf"
-    [Leland]="$VEROVIO/Leland/Leland.otf"
-    [Petaluma]="$PETALUMA/Petaluma.otf"
-)
+# a case, not an associative array: macOS ships bash 3.2
+font_url() {
+    case "$1" in
+        Bravura) echo "$VEROVIO/Bravura/Bravura.otf" ;;
+        Gootville) echo "$VEROVIO/Gootville/Gootville.otf" ;;
+        Leipzig) echo "$VEROVIO/Leipzig/Leipzig.ttf" ;;
+        Leland) echo "$VEROVIO/Leland/Leland.otf" ;;
+        Petaluma) echo "$PETALUMA/Petaluma.otf" ;;
+    esac
+}
 
 mkdir -p "$FONT_DIR"
 echo "Installing into $FONT_DIR (Verovio fonts from $VEROVIO_TAG)"
@@ -49,7 +58,7 @@ for name in Bravura Gootville Leipzig Leland Petaluma; do
         echo "  $name: already installed (${existing%%:*})"
         continue
     fi
-    url="${FONTS[$name]}"
+    url=$(font_url "$name")
     target="$FONT_DIR/${url##*/}"
     curl -fsSL --retry 3 -o "$target.part" "$url"
     mv "$target.part" "$target"

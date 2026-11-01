@@ -25,11 +25,23 @@ Python ≥ 3.13, Verovio ≥ 6.3. Tooling: `uv run ruff check`, `uv run ty check
 Music fonts: SMuFL characters inside text (metronome marks, figured bass) are
 drawn by cairosvg from installed fonts named after the engraving font. Install
 the five fonts Verovio engraves with (from the matching Verovio release, into
-`~/.local/share/fonts/musicset`) on every machine that builds datasets:
+`~/.local/share/fonts/musicset`, or `~/Library/Fonts/musicset` on macOS) on every
+machine that builds datasets:
 
 ```bash
 scripts/install-fonts.sh            # --force to reinstall; FONT_DIR=... for system-wide
 ```
+
+macOS: cairosvg needs Homebrew's cairo (`brew install cairo fontconfig`), which
+Python only finds with Homebrew's lib dir on the loader's fallback path. Put this
+in `~/.zshenv` so every shell, task and worker gets it:
+
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_FALLBACK_LIBRARY_PATH:-$HOME/lib:/usr/local/lib:/usr/lib}"
+```
+
+Homebrew's cairo picks fonts through CoreText, so fonts only fontconfig can see
+(`fc-match` passes) still render as fallback boxes.
 
 ## Usage
 
@@ -67,6 +79,7 @@ transposing ensembles) to try every command on in seconds.
 | `augment` | scan-like copies of a built dataset: images, moved boxes, graph copies |
 | `synth` | synthetic MusicXML: `exercise`, `piano`, `counterpoint`, `easy`, `melody`, `mutate`, `arrange` (see below) |
 | `counterpoint-pool` | compose species counterpoint for `synth counterpoint` (slow; resumable JSON lines) |
+| `symbols` | MNIST-like isolated symbol dataset (`32x32` default, `dataset.npz` + `ImageFolder` PNGs): fingerings `1`–`5`, ornaments, articulations, accidentals, dynamics and pedal, synthesized across fonts + tablet stylus strokes and/or cropped from built score datasets |
 | `view` | Qt viewer: page with boxes, graph edges and text target; the score graph as a network (ForceAtlas2, spring or page-position layout, nodes drawn as their SMuFL glyph or page crop, class/id labels, hover highlights neighbours, drag moves nodes); augmentation next to real scans; source pages, ground-truth and predicted **kern (`--pred-kern DIR`) engraved side by side with their match against the MEI, ordered worst first on request |
 
 Workers default to half the spare cores; set `MUSICSET_WORKERS` or `--workers`.
@@ -290,3 +303,34 @@ The generators therefore put octave clefs at the start of a part and only
 switch back to a plain treble clef mid-piece. Real scores rarely change to an
 octave clef mid-system; if they turn up, the fix is a `gClef8vaChange` /
 `gClef8vbChange` class pair (or reading the "8" off the glyph).
+
+## Symbol and ornament dataset
+
+`musicset symbols OUT` builds an MNIST-like grayscale classification dataset
+(`32x32` by default, black ink on white paper; `--invert` for classic
+white-on-black, `--size` for `28`, `64`, ...) covering 33 score markings across
+six groups (`--groups`):
+
+- **fingering** (`fing1`..`fing5`): digits `1`–`5` only;
+- **ornament**: `trill`, `mordent`, `turn`, `fermata`, `arpeg`;
+- **articulation**: `articStaccatoAbove`, `articTenutoAbove`,
+  `articAccentAbove`, `articStaccatissimoAbove`, `articMarcatoAbove`;
+- **accidental**: `accidentalFlat`, `accidentalNatural`, `accidentalSharp`,
+  `accidentalDoubleSharp`, `accidentalDoubleFlat`;
+- **dynamic**: `dynamicPiano`, `dynamicMezzo`, `dynamicForte`,
+  `dynamicSforzando`, `dynamicZ`, `dynamicPP`, `dynamicMP`, `dynamicMF`,
+  `dynamicFF`, `dynamicFFF`, `dynamicForzando`, `dynamicSforzato`;
+- **pedal**: `pedal`.
+
+```bash
+# Synthetic (SMuFL fonts + stylus stroke templates with elastic/tablet/scan augmentation)
+uv run musicset symbols data/symbols -n 500 --preset mixed --size 32
+
+# Combine synthetic samples with real crops extracted from a built score dataset
+uv run musicset symbols data/symbols -n 300 --from-dataset data/piano
+```
+
+Writes both `dataset.npz` (`x_train`, `y_train`, `x_val`, `y_val`, `x_test`,
+`y_test`, `classes`, loaded via `musicset.load_symbol_dataset`) and an
+`ImageFolder` directory tree (`train/<class>/*.png`, `val/`, `test/`) alongside
+`labels.json`.
