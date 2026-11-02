@@ -384,6 +384,8 @@ def cmd_symbols(args: argparse.Namespace) -> None:
         strokes=args.strokes,
         emnist=args.emnist,
         emnist_per_class=args.emnist_per_class,
+        fornes=args.fornes,
+        fornes_copies=args.fornes_copies,
         profile=args.profile,
         homus_copies=args.homus_copies,
         homus_brush=args.homus_brush,
@@ -639,7 +641,7 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="class set of one consumer: battuta (the editor's stylus model, with "
         "handwriting) or kakigori (every class, engraved only: no stroke templates, "
-        "--homus/--strokes/--emnist refused)",
+        "--homus/--strokes/--emnist/--fornes refused)",
     )
     p.add_argument(
         "--emnist",
@@ -654,6 +656,19 @@ def main(argv: list[str] | None = None) -> None:
         default=1000,
         help="EMNIST words per fingering/dynamic class for train+val; test gets its share "
         "from EMNIST's test file",
+    )
+    p.add_argument(
+        "--fornes",
+        type=Path,
+        default=None,
+        help="the Fornés Music_Symbols.zip or its extracted directory: scanned handwritten "
+        "clefs and accidentals, split by writer",
+    )
+    p.add_argument(
+        "--fornes-copies",
+        type=int,
+        default=1,
+        help="augmented renderings of each Fornés training scan",
     )
     p.add_argument(
         "--homus-copies",

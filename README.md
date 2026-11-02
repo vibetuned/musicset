@@ -332,7 +332,7 @@ eleven groups (`--groups`):
 `--profile` narrows the catalog to one consumer's set (`musicset.SYMBOL_PROFILES`):
 
 - **kakigori**: every class, engraved only (fonts and score crops; no stroke
-  templates, and `--homus`, `--strokes`, `--emnist` are refused), for the OMR
+  templates, and `--homus`, `--strokes`, `--emnist`, `--fornes` are refused), for the OMR
   pipeline that resolves the detector's merged classes;
 - **battuta**: the 43 classes a stylus user draws in the Battuta editor, with
   real handwriting. It leaves out every rest but `restQuarter` (the editor
@@ -353,6 +353,9 @@ uv run musicset symbols data/symbols -n 300 --homus ~/data/HOMUS.zip --homus-cop
 # Add real handwritten digits and letters (EMNIST byclass) for the fingerings and dynamics
 uv run musicset symbols data/symbols -n 300 --emnist ~/data/emnist --emnist-per-class 1000
 
+# Add scanned handwritten clefs and accidentals (Fornés, 4,094 images, writers never straddle splits)
+uv run musicset symbols data/symbols -n 300 --fornes ~/data/Music_Symbols.zip --fornes-copies 2
+
 # The two consumer sets
 uv run musicset symbols data/symbols-battuta --profile battuta -n 2000 \
     --from-dataset data/piano --homus ~/data/HOMUS.zip --homus-copies 2 --emnist ~/data/emnist
@@ -367,8 +370,9 @@ records the build settings and per-split counts.
 
 `s_<split>` holds each sample's source (`0` font glyph, `1` stylus stroke
 template, `2` score crop, `3` real pen strokes from HOMUS or an editor, `4`
-EMNIST handwriting), so a classifier can report stylus and real-crop accuracy
-separately; `w_<split>` the writer id of pen samples (`-1` otherwise). HOMUS
+EMNIST handwriting, `5` Fornés scans), so a classifier can report stylus and
+real-crop accuracy separately; `w_<split>` the writer id of handwritten samples
+(`-1` otherwise). HOMUS
 val/test samples are rendered once, deterministically, at their natural size,
 and their raw strokes are kept in `strokes_val.json` / `strokes_test.json` for
 stroke-level tests.
@@ -388,6 +392,25 @@ and val words come from EMNIST's train file, test words from its test file
 `--homus` and a `coda` class, every HOMUS writer also draws codas from their own
 strokes, one of their whole-note ovals crossed by two of their barlines
 (`musicset.homus.compose_homus_codas`), so the writer split still holds.
+
+`--fornes` (the CVC *Music Symbols* archive, `Music_Symbols.zip`,
+`musicset.fornes`) adds 4,094 scanned handwritten flats, naturals, sharps, double
+sharps and treble, bass and alto clefs, white on black with the staff removed (most
+bass clefs lack their dots). Each scan is inverted, cropped to its ink and placed
+like an EMNIST word, its strokes thickened to a pen: 0.05–0.13 of the canvas for
+train (as HOMUS), the editor's 0.05 for val and test, since the scans' fine lines
+would fade at 32 px. The writer comes from the file name; four writers go by a
+second name in the clef folders (`FORNES_ALIASES`) and count once. The split is by
+writer within two strata, the 8 writers who drew accidentals and the 14 who drew
+only clefs, so val and test hold both; the 52 clef files without a name form one
+group. Fornés draws its split, renders and contexts from its own generator: adding
+it leaves every other sample of a build unchanged, HOMUS's writer split included,
+except which copy of an image repeated within a split survives deduplication (22
+samples of the battuta build, the same image and label with another context).
+The dataset has no licence; its readme asks you to cite Fornés, Lladós & Sánchez
+(2008) and to acknowledge the Document Analysis Group of the Computer Vision Center.
+The official link is gone; the archive is mirrored in the
+[OMR-Datasets](https://github.com/apacha/OMR-Datasets) releases.
 
 Engraved `D.S.`, `D.C.` and `Fine` are rendered from the SMuFL `dalSegno` /
 `daCapo` glyphs and in Liberation, the text font Verovio embeds and sets

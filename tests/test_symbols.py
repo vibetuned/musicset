@@ -360,6 +360,7 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
         "crop": 1,
         "hand": 0,
         "emnist": 0,
+        "fornes": 0,
     }
     with np.load(out / "dataset.npz") as data:
         for split in ("train", "val", "test"):
@@ -373,7 +374,7 @@ def test_build_dataset_drops_blank_and_cross_split_duplicate_crops(tmp_path: Pat
         assert abs(c[0, 4] - (-4.5 / 6)) < 1e-6
     assert load_symbol_sources(out, "test").tolist() == [SOURCE_CROP]
     meta = json.loads((out / "labels.json").read_text())
-    assert meta["source_names"] == ["font", "stroke", "crop", "hand", "emnist"]
+    assert meta["source_names"] == ["font", "stroke", "crop", "hand", "emnist", "fornes"]
     assert meta["removed"] == {"blank": 4, "duplicate": 3}
     assert meta["from_dataset"] == [str(ds)]
     assert meta["crop_scores"] == {"train": 2, "val": 1, "test": 1}
@@ -461,10 +462,11 @@ def test_homus_reader_rendering_and_writer_split(tmp_path: Path):
         "crop": 0,
         "hand": 2,
         "emnist": 0,
+        "fornes": 0,
     }
     meta = json.loads((out / "labels.json").read_text())
     assert meta["homus_writers"] == {"train": 1, "val": 1, "test": 1}
-    assert meta["source_names"] == ["font", "stroke", "crop", "hand", "emnist"]
+    assert meta["source_names"] == ["font", "stroke", "crop", "hand", "emnist", "fornes"]
     with np.load(out / "dataset.npz") as data:
         assert set(data["s_test"].tolist()) == {SOURCE_HAND}
         assert set(data["w_test"].tolist()) <= {1, 2, 3} and len(set(data["w_train"].tolist())) == 1
@@ -718,7 +720,7 @@ def test_build_dataset_with_emnist(tmp_path: Path):
         assert set(data["s_train"].tolist()) == {SOURCE_EMNIST}
         assert data["y_train"].max() <= 16  # 5 fingerings + 12 dynamics
     meta = json.loads((out / "labels.json").read_text())
-    assert meta["emnist"] == str(root) and meta["source_names"][-1] == "emnist"
+    assert meta["emnist"] == str(root) and "emnist" in meta["source_names"]
 
 
 def _note_page() -> PageAnnotation:
@@ -930,3 +932,113 @@ def test_homus_codas_keep_their_writer():
         assert c.label == "coda" and len(c.strokes) == 3
         ys = [p[1] for st in c.strokes for p in st]
         assert 2.9 * unit <= max(ys) - min(ys) <= 4.7 * unit
+
+
+def _fornes_zip(path: Path, files: dict[str, tuple[int, int]]) -> Path:
+    """A Fornés-like archive: each file a white glyph (a bar of the given size) on black."""
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, (w, h) in files.items():
+            img = np.zeros((h + 6, w + 6), dtype=np.uint8)
+            img[3 : 3 + h, 3 : 3 + w] = 255
+            img[3 + h // 2, 3:-3] = 0  # a gap, so the crop is not one block
+            buf = io.BytesIO()
+            Image.fromarray(img, mode="L").save(buf, format="BMP")
+            archive.writestr(name, buf.getvalue())
+    return path
+
+
+def test_fornes_reader_merges_aliases_and_reads_ink_black_on_white(tmp_path: Path):
+    from musicset.fornes import UNKNOWN_WRITER, load_fornes, writer_of
+
+    assert writer_of("agata_BN_138.bmp") == "agata"
+    assert writer_of("do_xotazu_BN._9.bmp") == "xotazu"
+    assert writer_of("sol_alicia_BN._2.bmp") == "ali"
+    assert writer_of("fa_marsal_BN._1.bmp") == "marcal"
+    assert writer_of("Sol0.bmp") == writer_of("fa3a.bmp") == UNKNOWN_WRITER
+    archive = _fornes_zip(
+        tmp_path / "Music_Symbols.zip",
+        {
+            "ACCIDENTAL_Sharp/ali_BN_1.bmp": (8, 12),
+            "CLEF_Trebble/sol_alicia_BN._3.bmp": (6, 20),
+            "CLEF_Bass/fa3a.bmp": (10, 10),
+            "OTHER/agata_BN_1.bmp": (5, 5),
+        },
+    )
+    samples = load_fornes(archive)
+    assert [(s.label, s.writer) for s in samples] == [
+        ("accidentalSharp", "ali"),
+        ("fClef", UNKNOWN_WRITER),
+        ("gClef", "ali"),
+    ]
+    sharp = samples[0].image
+    assert sharp.shape == (12, 8)  # cropped to the ink
+    assert sharp[0, 0] == 0 and sharp[6].min() == 255  # black ink, the gap white
+
+
+def test_build_with_fornes_splits_writers_and_leaves_the_rest_alone(tmp_path: Path):
+    from musicset.fornes import FORNES_WRITER_BASE
+    from musicset.symbols import SOURCE_FORNES
+
+    # every scan a different size: identical renders would be deduplicated across splits
+    files: dict[str, tuple[int, int]] = {}
+    for i, w in enumerate(("agata", "anna", "josep", "juan")):  # accidentals and clefs
+        for k in range(3):
+            files[f"ACCIDENTAL_Sharp/{w}_BN_{k}.bmp"] = (8 + k, 12 + 2 * i)
+            files[f"ACCIDENTAL_DoubSharp/{w}_BN_{k}.bmp"] = (9 + i, 9 + k)
+            files[f"CLEF_Trebble/sol_{w}_BN._{k}.bmp"] = (6 + i, 20 + 4 * k)
+    for i, w in enumerate(("anton", "borja", "gemma", "monica")):  # clefs only
+        for k in range(3):
+            files[f"CLEF_Trebble/sol_{w}_BN._{k}.bmp"] = (11 + 3 * i + k, 34)
+    archive = _fornes_zip(tmp_path / "Music_Symbols.zip", files)
+    with pytest.raises(ValueError, match="engraved only"):
+        build_symbol_dataset(
+            tmp_path / "k", samples_per_class=1, profile="kakigori", fornes=archive
+        )
+
+    def build(out: Path, fornes: Path | None) -> dict[str, list[tuple]]:
+        build_symbol_dataset(
+            out,
+            samples_per_class=6,
+            profile="battuta",
+            groups=("accidental", "clef"),
+            fornes=fornes,
+            fornes_copies=2,
+            split=(0.5, 0.25, 0.25),
+            min_ink=1,
+            write_png=False,
+        )
+        rows: dict[str, list[tuple]] = {}
+        with np.load(out / "dataset.npz") as data:
+            for split in ("train", "val", "test"):
+                rows[split] = [
+                    (x.tobytes(), int(y), int(s), int(w), c.tobytes())
+                    for x, y, s, w, c in zip(
+                        data[f"x_{split}"],
+                        data[f"y_{split}"],
+                        data[f"s_{split}"],
+                        data[f"w_{split}"],
+                        data[f"c_{split}"],
+                        strict=True,
+                    )
+                ]
+        return rows
+
+    plain = build(tmp_path / "plain", None)
+    with_fornes = build(tmp_path / "fornes", archive)
+    meta = json.loads((tmp_path / "fornes" / "labels.json").read_text())
+    assert meta["fornes_writers"] == {"train": 4, "val": 2, "test": 2}
+    classes = meta["classes"]
+    writers: dict[str, set[int]] = {}
+    for split, rows in with_fornes.items():
+        scans = [r for r in rows if r[2] == SOURCE_FORNES]
+        # battuta has no double sharp; every split holds an accidental writer's sharps
+        assert {classes[r[1]] for r in scans} == {"accidentalSharp", "gClef"}
+        writers[split] = {r[3] for r in scans}
+        assert min(writers[split]) >= FORNES_WRITER_BASE
+        # every other sample is the one the build without Fornés made
+        assert sorted(r for r in rows if r[2] != SOURCE_FORNES) == sorted(plain[split])
+    assert not (writers["train"] & writers["val"] or writers["train"] & writers["test"])
+    assert not writers["val"] & writers["test"]

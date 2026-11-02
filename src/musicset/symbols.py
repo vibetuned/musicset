@@ -67,6 +67,7 @@ from musicset.emnist import (
     compose_word,
     load_emnist,
 )
+from musicset.fornes import fornes_writer_ids, load_fornes
 from musicset.homus import (
     Stroke,
     StrokeSample,
@@ -98,11 +99,12 @@ EDITOR_PEN_WIDTH = 0.05
 the width the score editor sends (``granita.DEFAULT_PEN_WIDTH``; it scored best on
 held-out writers). Training renders span 0.05-0.13."""
 
-SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP, SOURCE_HAND, SOURCE_EMNIST = 0, 1, 2, 3, 4
-SOURCE_NAMES = ("font", "stroke", "crop", "hand", "emnist")
+SOURCE_FONT, SOURCE_STROKE, SOURCE_CROP, SOURCE_HAND, SOURCE_EMNIST, SOURCE_FORNES = range(6)
+SOURCE_NAMES = ("font", "stroke", "crop", "hand", "emnist", "fornes")
 """Per-sample provenance, stored as ``s_<split>`` in ``dataset.npz``: SMuFL glyph
 render, stylus stroke template, score crop, real pen strokes (HOMUS or an editor),
-real handwritten digits and letters (EMNIST) for fingerings and dynamics."""
+real handwritten digits and letters (EMNIST) for fingerings and dynamics, scanned
+handwritten clefs and accidentals (Fornés)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1112,6 +1114,17 @@ def render_symbol(
     return image
 
 
+def ink_stroke_width(ink: np.ndarray) -> float:
+    """Mean stroke width, in pixels, of a black-on-white ink image: twice the ink's area
+    over its boundary (2 for any stroke one or two pixels wide)."""
+    m = ink < 128
+    if not m.any():
+        return 0.0
+    p = np.pad(m, 1)
+    inner = p[1:-1, 1:-1] & p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:]
+    return 2.0 * float(m.sum()) / max(1, int((m & ~inner).sum()))
+
+
 def render_ink_sample(
     ink: np.ndarray,
     *,
@@ -1121,10 +1134,13 @@ def render_ink_sample(
     strength: float = 1.0,
     invert: bool = False,
     rng: np.random.Generator | int | None = None,
+    pen: float | None = None,
 ) -> np.ndarray:
     """Put a black-on-white ink image (a handwritten glyph or word) on the symbol canvas
     like a stylus template: centred, aspect kept, its longer side spanning ``fraction``
-    of the canvas; presets other than ``clean`` add the tablet/scan augmentations."""
+    of the canvas; presets other than ``clean`` add the tablet/scan augmentations.
+    ``pen`` (a fraction of the canvas, like ``EDITOR_PEN_WIDTH``) thickens strokes
+    thinner than that pen to its width, for scans whose fine lines would fade at 32 px."""
     if preset not in PRESETS:
         raise ValueError(f"unknown preset {preset!r}: {PRESETS}")
     gen = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
@@ -1133,6 +1149,13 @@ def render_ink_sample(
     scale = canvas * fraction / max(1, h, w)
     tw, th = max(1, round(w * scale)), max(1, round(h * scale))
     glyph = Image.fromarray(ink, mode="L").resize((tw, th), Image.Resampling.BILINEAR)
+    grow = 0 if pen is None else round((pen * canvas - ink_stroke_width(ink) * scale) / 2)
+    if grow > 0:
+        yy, xx = np.mgrid[-grow : grow + 1, -grow : grow + 1]
+        padded = np.pad(np.asarray(glyph), grow, constant_values=255)
+        thick = ndimage.grey_erosion(padded, footprint=xx * xx + yy * yy <= grow * grow)
+        glyph = Image.fromarray(thick.astype(np.uint8), mode="L")
+        tw, th = glyph.size
     page = Image.new("L", (canvas, canvas), 255)
     shift = canvas * 0.06 if preset != "clean" else 0.0
     x = round((canvas - tw) / 2 + (gen.uniform(-shift, shift) if shift else 0.0))
@@ -1253,6 +1276,37 @@ def _render_hand_task(
         preset="clean",
         invert=invert,
         rng=rng,
+    )
+
+
+FornesTask = tuple[np.ndarray, float, float, int, float, bool, int, int, int, bool]
+
+
+def _render_fornes_task(task: FornesTask) -> np.ndarray:
+    """One Fornés scan placed like an EMNIST word, its strokes thickened to a pen: for
+    ``train`` augmented at a jittered size with a pen 0.05-0.13 wide (HOMUS's), else
+    clean with the editor's pen."""
+    image, lo, hi, size, strength, invert, seed, j, k, train = task
+    rng = np.random.default_rng([seed, SOURCE_FORNES, j, k])
+    if train:
+        return render_ink_sample(
+            image,
+            size=size,
+            fraction=float(rng.uniform(lo, hi)),
+            preset="tablet",
+            strength=strength,
+            invert=invert,
+            rng=rng,
+            pen=float(rng.uniform(0.05, 0.13)),
+        )
+    return render_ink_sample(
+        image,
+        size=size,
+        fraction=0.5 * (lo + hi),
+        preset="clean",
+        invert=invert,
+        rng=rng,
+        pen=EDITOR_PEN_WIDTH,
     )
 
 
@@ -1947,6 +2001,8 @@ def build_symbol_dataset(
     strokes: Sequence[Path] = (),
     emnist: Path | None = None,
     emnist_per_class: int = 1000,
+    fornes: Path | None = None,
+    fornes_copies: int = 1,
     profile: str | None = None,
     homus_copies: int = 1,
     homus_brush: float = 0.0,
@@ -1996,9 +2052,19 @@ def build_symbol_dataset(
     test file. With ``homus`` and a ``coda`` class, each HOMUS writer also contributes
     codas composed from their own strokes (:func:`musicset.homus.compose_homus_codas`).
 
+    ``fornes`` (the ``Music_Symbols.zip`` archive, :mod:`musicset.fornes`) adds scanned
+    handwritten clefs and accidentals (``SOURCE_FORNES``), split by writer within two
+    strata — the writers with accidentals and those with clefs only — so val and test
+    hold both; train scans are rendered ``fornes_copies`` times. Its split, renders and
+    contexts draw from their own generator, so adding it leaves every other sample of a
+    build as it was: only the order changes, and with it which copy of an image repeated
+    within a split survives deduplication (22 of 148,791 samples in the battuta build,
+    the same image and label with another context).
+
     ``profile`` (``SYMBOL_PROFILES``) narrows the classes to one consumer's set:
     ``battuta`` for the editor's stylus model, ``kakigori`` for the OMR pipeline, which is
-    engraved only (no stroke templates, and ``homus`` / ``strokes`` / ``emnist`` refused).
+    engraved only (no stroke templates, and ``homus`` / ``strokes`` / ``emnist`` /
+    ``fornes`` refused).
     * ``out/labels.json`` (class list, index map, group map, build settings,
       per-class, per-split and per-source counts, removed samples);
     * ``out/strokes_<split>.json`` for HOMUS val/test samples;
@@ -2006,8 +2072,17 @@ def build_symbol_dataset(
     """
     if samples_per_class < 0:
         raise ValueError("samples_per_class must be >= 0")
-    if samples_per_class == 0 and not from_dataset and homus is None and not strokes and not emnist:
-        raise ValueError("need samples_per_class > 0, from_dataset, homus, strokes or emnist")
+    if (
+        samples_per_class == 0
+        and not from_dataset
+        and homus is None
+        and not strokes
+        and not emnist
+        and fornes is None
+    ):
+        raise ValueError(
+            "need samples_per_class > 0, from_dataset, homus, strokes, emnist or fornes"
+        )
 
     profile_classes: tuple[str, ...] | None = None
     stroke_templates = True
@@ -2015,8 +2090,11 @@ def build_symbol_dataset(
         if profile not in SYMBOL_PROFILES:
             raise ValueError(f"unknown profile {profile!r}: {sorted(SYMBOL_PROFILES)}")
         prof = SYMBOL_PROFILES[profile]
-        if not prof.handwriting and (homus is not None or strokes or emnist is not None):
-            raise ValueError(f"profile {profile!r} is engraved only: drop homus, strokes, emnist")
+        handwriting = homus is not None or strokes or emnist is not None or fornes is not None
+        if not prof.handwriting and handwriting:
+            raise ValueError(
+                f"profile {profile!r} is engraved only: drop homus, strokes, emnist, fornes"
+            )
         profile_classes, stroke_templates = prof.classes, prof.handwriting
     specs = symbol_specs(groups, profile_classes)
     if not specs:
@@ -2239,6 +2317,66 @@ def build_symbol_dataset(
                         for j in kept
                     ]
 
+    # Fornés scans: their own generator for the split, the renders and the contexts, so the
+    # rest of the build draws exactly what it drew without them
+    side_rng = np.random.default_rng([seed, SOURCE_FORNES])
+    side_pieces: dict[
+        str, list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
+    ] = {"train": [], "val": [], "test": []}
+    fornes_writers: dict[str, int] = {}
+    if fornes is not None:
+        scans = [smp for smp in load_fornes(fornes) if smp.label in class_to_idx]
+        fo_ids = fornes_writer_ids(scans)
+        fo_writers = np.array([smp.writer for smp in scans], dtype=str)
+        with_accidentals = {
+            s.writer for s in scans if SYMBOL_BY_NAME[s.label].group == "accidental"
+        }
+        stratum = np.array([w in with_accidentals for w in fo_writers], dtype=bool)
+        fo_rows: dict[str, list[int]] = {"train": [], "val": [], "test": []}
+        for part in (stratum, ~stratum):
+            rows = np.flatnonzero(part)
+            for name, i in _group_split_indices(fo_writers[rows], split, side_rng).items():
+                fo_rows[name] += rows[i].tolist()
+        for name, rows_ in fo_rows.items():
+            if not rows_:
+                continue
+            fornes_writers[name] = len({fo_writers[j] for j in rows_})
+            train = name == "train"
+            copies = max(1, fornes_copies) if train else 1
+            order_j = [j for j in rows_ for _ in range(copies)]
+            fo_tasks: list[FornesTask] = [
+                (
+                    scans[j].image,
+                    *SYMBOL_BY_NAME[scans[j].label].scale_range,
+                    size,
+                    strength,
+                    invert,
+                    seed,
+                    j,
+                    k,
+                    train,
+                )
+                for j in rows_
+                for k in range(copies)
+            ]
+            fx = np.empty((len(fo_tasks), size, size), dtype=np.uint8)
+            for n, image in enumerate(_run_tasks(_render_fornes_task, fo_tasks, workers, 64)):
+                fx[n] = image
+            fy = np.array([class_to_idx[scans[j].label] for j in order_j], dtype=np.int64)
+            fw = np.array([fo_ids[scans[j].writer] for j in order_j], dtype=np.int32)
+            m = inked_mask(fx)
+            n_ = int(m.sum())
+            side_pieces[name].append(
+                (
+                    fx[m],
+                    fy[m],
+                    np.full(n_, SOURCE_FORNES, dtype=np.uint8),
+                    fw[m],
+                    unknown_context(n_),
+                    np.ones(n_, bool),
+                )
+            )
+
     # Contexts for samples without a real one: drawn from the real crops of their class
     # (with family fallback for rare note durations / meters, and split-local pools when >= 10)
     stemmed_idxs = [
@@ -2282,6 +2420,9 @@ def build_symbol_dataset(
                     _fill_contexts(pc, py, pfill, split_pools, context_p, rng),
                     pfill,
                 )
+        for px, py, ps, pw, pc, pfill in side_pieces[name]:
+            fc = _fill_contexts(pc, py, pfill, split_pools, context_p, side_rng)
+            parts.append((px, py, ps, pw, fc, pfill))
     for name, records in stroke_records.items():
         piece_c = pieces[name][hand_piece_index[name]][4]
         for record, ctx in zip(records, piece_c, strict=True):
@@ -2378,6 +2519,8 @@ def build_symbol_dataset(
         "homus": None if homus is None else str(homus),
         "emnist": None if emnist is None else str(emnist),
         "emnist_per_class": emnist_per_class,
+        "fornes": None if fornes is None else str(fornes),
+        "fornes_copies": fornes_copies,
         "strokes": [str(p) for p in strokes],
         "homus_copies": homus_copies,
         "homus_brush": homus_brush,
@@ -2391,6 +2534,7 @@ def build_symbol_dataset(
         "source_counts": source_counts,
         "crop_scores": crop_scores,
         "homus_writers": homus_writers,
+        "fornes_writers": fornes_writers,
         "context_features": list(CONTEXT_FEATURES),
         "context_p": context_p,
         "context_pools": {class_names[k]: len(v) for k, v in sorted(pools.items())},
@@ -2439,6 +2583,7 @@ __all__ = [
     "SOURCE_CROP",
     "SOURCE_EMNIST",
     "SOURCE_FONT",
+    "SOURCE_FORNES",
     "SOURCE_HAND",
     "SOURCE_NAMES",
     "SOURCE_STROKE",
@@ -2453,6 +2598,7 @@ __all__ = [
     "extract_page_symbols",
     "generate_symbol_samples",
     "generate_symbol_samples_with_sources",
+    "ink_stroke_width",
     "load_symbol_dataset",
     "load_symbol_sources",
     "normalize_strokes",
