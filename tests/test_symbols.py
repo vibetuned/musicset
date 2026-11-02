@@ -8,6 +8,7 @@ from PIL import Image
 from musicset.annotate.schema import Element, Glyph, PageAnnotation
 from musicset.cli import main
 from musicset.context import CONTEXT_DIM
+from musicset.homus import StrokeSample
 from musicset.pipeline import PAGE_SUFFIX
 from musicset.symbols import (
     PRESETS,
@@ -29,7 +30,8 @@ from musicset.symbols import (
 
 def test_symbol_catalog_covers_fingerings_1_to_5_and_all_groups():
     names = [s.name for s in SYMBOLS]
-    assert len(names) == len(set(names)) == 51
+    assert len(names) == len(set(names)) == 56
+    assert names[-5:] == ["dalSegno", "daCapo", "fine", "segno", "coda"]
     assert (
         names[:33] == [s.name for s in SYMBOLS[:33]] and names[32] == "pedal"
     )  # old indices stable
@@ -508,8 +510,10 @@ def test_context_vector_and_page_geometry():
     assert v[0] == 1.0 and v[1] == 1.0 and v[2] == 0.0 and v[3] == 0.0  # inside the staff lines
     assert abs(v[4] - (-1.75 / 6)) < 1e-6
     assert abs(v[5] - 0.34) < 1e-6 and abs(v[6] - 1.0) < 1e-6  # barline clipped at 8
-    # the note is 1.25 spaces to the left: beside it, not in its column
-    assert v[7] == 1.0 and (v[8], v[9], v[10], v[11]) == (0.0, 0.0, 0.0, 1.0)
+    # a page without note elements falls back to the notehead glyph (1 x 1 space): the
+    # symbol is up and to the right of it, diagonal, so no side flag
+    assert v[7] == 1.0 and (v[8], v[9], v[10], v[11]) == (0.0, 0.0, 0.0, 0.0)
+    assert ctx.note_w is not None and abs(ctx.note_w - 1.0) < 1e-9
     assert abs(v[12] - 1.25 / 8) < 1e-6 and abs(v[13] - (-1.75 / 8)) < 1e-6
     # a staccato-like mark straight above the notehead, outside the staff
     above = context_vector(SymbolContext(-3.0, 0.5, 4.0, 0.2, -2.5, 0.4, 0.4))
@@ -629,7 +633,12 @@ def test_emnist_reader_and_word_composition(tmp_path: Path):
     from musicset.symbols import SYMBOL_BY_NAME
 
     assert set(EMNIST_SYMBOLS) <= set(SYMBOL_BY_NAME)
-    assert all(c in BYCLASS_CHARS for words in EMNIST_SYMBOLS.values() for w in words for c in w)
+    assert all(
+        c in BYCLASS_CHARS or c == "."
+        for words in EMNIST_SYMBOLS.values()
+        for w in words
+        for c in w
+    )
 
     # two fake EMNIST samples: a "1" and a "p", stored transposed and white-on-black
     one = np.zeros((28, 28), dtype=np.uint8)
@@ -710,3 +719,214 @@ def test_build_dataset_with_emnist(tmp_path: Path):
         assert data["y_train"].max() <= 16  # 5 fingerings + 12 dynamics
     meta = json.loads((out / "labels.json").read_text())
     assert meta["emnist"] == str(root) and meta["source_names"][-1] == "emnist"
+
+
+def _note_page() -> PageAnnotation:
+    """A staff (space 20, middle line y=140) with a stem-up quarter note and a two-note
+    chord whose stem points down."""
+    return PageAnnotation(
+        score="s",
+        page=1,
+        width=1000.0,
+        height=400.0,
+        pixel_width=1000.0,
+        pixel_height=400.0,
+        elements=[
+            Element("sys", ("system-staff",), (0, 100, 1000, 180)),
+            Element("m", ("measure",), (0, 50, 900, 250)),
+            Element("n1", ("note",), (300, 70, 340, 150), parent=1),
+            Element(None, ("notehead",), (300, 130, 320, 150), parent=2),
+            Element(None, ("stem",), (318, 70, 320, 140), parent=2),
+            Element(None, ("accid",), (280, 130, 292, 150), parent=2),  # not part of the body
+            Element("c1", ("chord",), (600, 100, 620, 230), parent=1),
+            Element("n2", ("note",), (600, 100, 620, 120), parent=6),
+            Element(None, ("notehead",), (600, 100, 620, 120), parent=7),
+            Element("n3", ("note",), (600, 140, 620, 160), parent=6),
+            Element(None, ("notehead",), (600, 140, 620, 160), parent=9),
+            Element(None, ("stem",), (600, 110, 602, 230), parent=6),
+        ],
+    )
+
+
+def test_context_uses_note_and_chord_bodies():
+    from musicset.context import PageGeometry, context_vector, note_bodies
+
+    page = _note_page()
+    bodies = sorted(map(tuple, note_bodies(page).tolist()))
+    # the quarter note: notehead + stem, without its accidental; the chord: both noteheads
+    # and its stem as one body
+    assert bodies == [(300, 70, 320, 150), (600, 100, 620, 230)]
+    geo = PageGeometry(page)
+    # augmentation dot right of the quarter's notehead: right of the body, centre (310, 110)
+    dot = geo.context((328, 134, 334, 140))
+    assert dot is not None and dot.note_dx is not None and dot.note_dy is not None
+    assert abs(dot.note_dx - (331 - 310) / 20) < 1e-9 and abs(dot.note_dy - (137 - 110) / 20) < 1e-9
+    assert abs(dot.note_w - 1.0) < 1e-9 and abs(dot.note_h - 4.0) < 1e-9
+    v = context_vector(dot)
+    assert (v[8], v[9], v[10], v[11]) == (0.0, 0.0, 0.0, 1.0)
+    # staccato under the notehead (stem up): below the body
+    below = context_vector(geo.context((306, 156, 314, 164)))
+    assert (below[8], below[9], below[10], below[11]) == (0.0, 1.0, 0.0, 0.0)
+    # fingering above the chord: above the body whose centre is the chord's, not a head's
+    over = geo.context((604, 70, 616, 90))
+    assert over is not None and abs(over.note_dy - (80 - 165) / 20) < 1e-9
+    v = context_vector(over)
+    assert (v[8], v[9], v[10], v[11]) == (1.0, 0.0, 0.0, 0.0)
+    # sharp left of the chord's lower note: left of the chord body
+    v = context_vector(geo.context((580, 140, 592, 160)))
+    assert (v[8], v[9], v[10], v[11]) == (0.0, 0.0, 1.0, 0.0)
+    # a crop of the quarter note itself: its own body is not its neighbour, the chord is
+    # out of range, so no note
+    own = geo.context((300, 70, 320, 150))
+    assert own is not None and own.note_dx is None and own.note_w is None
+    assert context_vector(own)[7] == 0.0
+
+
+def test_profiles_and_navigation_marks():
+    from musicset.symbols import (
+        BATTUTA_DROPPED,
+        SYMBOL_PROFILES,
+        _text_mark_class,
+        render_symbol,
+    )
+
+    kakigori, battuta = SYMBOL_PROFILES["kakigori"], SYMBOL_PROFILES["battuta"]
+    assert kakigori.classes == tuple(s.name for s in SYMBOLS) and not kakigori.handwriting
+    assert len(battuta.classes) == 43 and battuta.handwriting
+    assert "restQuarter" in battuta.classes and not set(BATTUTA_DROPPED) & set(battuta.classes)
+    assert [s.name for s in symbol_specs(("rest", "navigation"), battuta.classes)] == [
+        "restQuarter",
+        "dalSegno",
+        "daCapo",
+        "fine",
+        "segno",
+        "coda",
+    ]
+    assert _text_mark_class(" D.C. ") == "daCapo" and _text_mark_class("D. S.") == "dalSegno"
+    assert _text_mark_class("Fine") == "fine" and _text_mark_class("D.C. al Fine") is None
+    for name in ("dalSegno", "daCapo", "fine", "segno", "coda"):
+        for seed in range(4):  # text and glyph renders alike
+            img = render_symbol(name, size=32, preset="clean", rng=seed)
+            assert img.shape == (32, 32) and (img < 128).sum() > 10
+
+
+def test_page_crops_find_navigation_text(tmp_path: Path):
+    page = PageAnnotation(
+        score="s",
+        page=1,
+        width=1000.0,
+        height=400.0,
+        pixel_width=1000.0,
+        pixel_height=400.0,
+        elements=[
+            Element("sys", ("system-staff",), (0, 100, 1000, 180)),
+            Element("d1", ("dir",), (100, 40, 160, 70), text="D.C."),
+            Element("d2", ("dir",), (300, 40, 420, 70), text="D.C. al Fine"),
+            Element("d3", ("dir",), (500, 40, 560, 70), text="Fine"),
+            Element("r1", ("repeatMark",), (700, 30, 740, 80)),
+        ],
+        glyphs=[Glyph("E048", (700, 30, 740, 80), element=4)],
+    )
+    found = sorted(cls for cls, _ in page_symbol_boxes(page, (1000, 400)))
+    assert found == ["coda", "daCapo", "fine"]
+
+
+def test_build_profiles(tmp_path: Path):
+    with pytest.raises(ValueError, match="engraved only"):
+        build_symbol_dataset(
+            tmp_path / "x", samples_per_class=1, profile="kakigori", emnist=tmp_path
+        )
+    out = tmp_path / "k"
+    report = build_symbol_dataset(
+        out,
+        samples_per_class=4,
+        profile="kakigori",
+        groups=("ornament", "navigation"),
+        preset="tablet",
+        split=(0.5, 0.25, 0.25),
+        min_ink=1,
+        write_png=False,
+    )
+    assert report.classes == (
+        "trill",
+        "mordent",
+        "turn",
+        "fermata",
+        "arpeg",
+        "dalSegno",
+        "daCapo",
+        "fine",
+        "segno",
+        "coda",
+    )
+    assert sum(report.source_counts[s]["stroke"] for s in report.source_counts) == 0
+    meta = json.loads((out / "labels.json").read_text())
+    assert meta["profile"] == "kakigori" and meta["stroke_templates"] is False
+    out = tmp_path / "b"
+    report = build_symbol_dataset(
+        out,
+        samples_per_class=2,
+        profile="battuta",
+        groups=("rest", "barline"),
+        min_ink=1,
+        write_png=False,
+    )
+    assert report.classes == ("restQuarter",)
+
+
+def test_emnist_signs_and_case_heights():
+    from musicset.emnist import (
+        EMNIST_SIGNS,
+        compose_sign,
+        compose_word,
+        ink_bbox,
+    )
+    from musicset.symbols import SYMBOL_BY_NAME
+
+    assert set(EMNIST_SIGNS) <= set(SYMBOL_BY_NAME)
+    rng = np.random.default_rng(0)
+    square = np.full((28, 28), 255, dtype=np.uint8)
+    square[4:24, 4:24] = 0
+    ring = square.copy()
+    ring[8:20, 8:20] = 255
+    bar = np.full((28, 28), 255, dtype=np.uint8)
+    bar[4:24, 12:16] = 0
+    ess = np.full((28, 28), 255, dtype=np.uint8)
+    ess[4:8, 8:22] = 0
+    ess[4:16, 8:12] = 0
+    ess[12:16, 8:22] = 0
+    ess[12:24, 18:22] = 0
+    ess[20:24, 6:22] = 0
+    for cls, glyphs in (("coda", (ring, bar)), ("segno", (ess, bar)), ("turn", (ess,))):
+        img = compose_sign(cls, glyphs, rng)
+        assert img.ndim == 2 and ink_bbox(img) is not None
+    turn = compose_sign("turn", (ess,), rng)
+    assert turn.shape[1] > turn.shape[0]  # an S laid on its side is wide
+    # "D." : the dot is drawn, small and on the baseline; lowercase "e" is shorter than "F"
+    word = compose_word((square, np.zeros((0, 0), np.uint8)), rng, chars="D.", jitter=0.0)
+    assert word.shape[1] > word.shape[0]
+    fe = compose_word((square, square), rng, chars="Fe", gap=(0.3, 0.3), jitter=0.0)
+    cols = np.flatnonzero((fe < 128).any(axis=0))
+    split_at = cols[np.flatnonzero(np.diff(cols) > 1)[0]] + 1
+    tall = (fe[:, :split_at] < 128).any(axis=1).sum()
+    short = (fe[:, split_at:] < 128).any(axis=1).sum()
+    assert short < 0.75 * tall
+
+
+def test_homus_codas_keep_their_writer():
+    from musicset.homus import CANVAS_STAFF_SPACES, HOMUS_CANVAS, compose_homus_codas
+
+    oval = tuple((10 + 8 * np.cos(t), 10 + 6 * np.sin(t)) for t in np.linspace(0, 6.28, 20))
+    line = tuple((50.0 + 0.3 * k, 10.0 + 4 * k) for k in range(10))
+    samples = [
+        StrokeSample(7, "noteWhole", (oval,)),
+        StrokeSample(7, "barlineSingle", (line,)),
+        StrokeSample(8, "noteWhole", (oval,)),  # no barline: no coda
+    ]
+    codas = compose_homus_codas(samples, per_writer=3, seed=0)
+    assert len(codas) == 3 and {c.writer for c in codas} == {7}
+    unit = HOMUS_CANVAS / CANVAS_STAFF_SPACES
+    for c in codas:
+        assert c.label == "coda" and len(c.strokes) == 3
+        ys = [p[1] for st in c.strokes for p in st]
+        assert 2.9 * unit <= max(ys) - min(ys) <= 4.7 * unit

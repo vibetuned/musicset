@@ -19,6 +19,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from musicset.context import SymbolContext
 
 Point = tuple[float, float]
@@ -172,11 +174,91 @@ def stroke_fraction_from_staff_space(
     return float(min(hi, max(lo, stroke_span(strokes) / (CANVAS_STAFF_SPACES * staff_space))))
 
 
+CODA_SPACES = (3.0, 4.6)
+"""Height of a composed handwritten coda in staff spaces (engraved ones span 2.5-4.9;
+handwritten ones run a little larger)."""
+
+
+def _principal(stroke: Sequence[Point]) -> tuple[np.ndarray, np.ndarray] | None:
+    """Coordinates of a stroke along and across its main direction, centred."""
+    arr = np.asarray(stroke, dtype=np.float64)
+    if len(arr) < 2:
+        return None
+    centred = arr - arr.mean(axis=0)
+    _, _, vt = np.linalg.svd(centred, full_matrices=False)
+    along, across = centred @ vt[0], centred @ vt[1]
+    if np.ptp(along) <= 1e-9:
+        return None
+    return along, across
+
+
+def compose_homus_codas(
+    samples: Sequence[StrokeSample], *, per_writer: int = 6, seed: int = 0
+) -> list[StrokeSample]:
+    """Handwritten codas from each HOMUS writer's own pen strokes (HOMUS has none).
+
+    One of the writer's whole-note ovals, made roughly round, is crossed by two of
+    their barlines, one stood upright and one laid level, both overshooting the circle
+    by 1.3-1.7 times, the way a coda is drawn: circle first, then the cross. Every
+    composite keeps its writer, so a split by writer still holds, and is sized to
+    ``CODA_SPACES`` staff spaces in HOMUS pen units. Writers without a whole note or a
+    barline give none.
+    """
+    ovals: dict[int, list[StrokeSample]] = {}
+    bars: dict[int, list[StrokeSample]] = {}
+    for smp in samples:
+        if smp.label == "noteWhole":
+            ovals.setdefault(smp.writer, []).append(smp)
+        elif smp.label == "barlineSingle":
+            bars.setdefault(smp.writer, []).append(smp)
+    unit = HOMUS_CANVAS / CANVAS_STAFF_SPACES  # pen units per staff space
+    out: list[StrokeSample] = []
+    for writer in sorted(set(ovals) & set(bars)):
+        rng = np.random.default_rng([seed, 11, writer])
+        for k in range(per_writer):
+            oval = ovals[writer][int(rng.integers(len(ovals[writer])))]
+            pts = np.array([p for stroke in oval.strokes for p in stroke], dtype=np.float64)
+            lo, hi = pts.min(axis=0), pts.max(axis=0)
+            size = np.maximum(hi - lo, 1e-9)
+            centre = 0.5 * (lo + hi)
+            aspect = float(rng.uniform(0.85, 1.15))
+            strokes: list[np.ndarray] = [
+                (np.asarray(stroke, dtype=np.float64) - centre) / size * (aspect, 1.0)
+                for stroke in oval.strokes
+            ]
+            for upright in (True, False):
+                bar = bars[writer][int(rng.integers(len(bars[writer])))]
+                axes = _principal(max(bar.strokes, key=len))
+                if axes is None:
+                    continue
+                along, across = axes
+                length = float(rng.uniform(1.3, 1.7))
+                a = along / np.ptp(along) * length
+                c = across / np.ptp(along) * length
+                line = np.stack([c, a], axis=1) if upright else np.stack([a, c], axis=1)
+                tilt = np.deg2rad(float(rng.normal(0.0, 4.0)))
+                rot = np.array([[np.cos(tilt), -np.sin(tilt)], [np.sin(tilt), np.cos(tilt)]])
+                strokes.append(line @ rot.T + rng.uniform(-0.06, 0.06, size=2))
+            allp = np.concatenate(strokes)
+            height = float(np.ptp(allp[:, 1]))
+            if height <= 1e-9:
+                continue
+            scale = float(rng.uniform(*CODA_SPACES)) * unit / height
+            origin = allp.min(axis=0)
+            composed = tuple(
+                tuple((float(x), float(y)) for x, y in (st - origin) * scale) for st in strokes
+            )
+            out.append(StrokeSample(writer, "coda", composed, source=f"homus-coda/{writer}-{k}"))
+    return out
+
+
 __all__ = [
     "CANVAS_STAFF_SPACES",
+    "CODA_SPACES",
     "HOMUS_CANVAS",
     "HOMUS_CLASSES",
     "StrokeSample",
+    "compose_homus_codas",
     "load_homus",
     "parse_homus",
     "stroke_fraction",

@@ -6,6 +6,7 @@ from musicset.render.engrave import Engraving, rasterize
 from musicset.render.options import RenderOptions
 from musicset.symbols import (
     SYMBOL_GROUPS,
+    SYMBOL_PROFILES,
     SYMBOLS,
     build_symbol_dataset,
     extract_dataset_symbols,
@@ -20,6 +21,7 @@ from musicset.views.detection import ClassMap, detection_annotations
 __all__ = [
     "SYMBOLS",
     "SYMBOL_GROUPS",
+    "SYMBOL_PROFILES",
     "ClassMap",
     "Element",
     "Engraving",

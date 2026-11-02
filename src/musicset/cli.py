@@ -384,6 +384,7 @@ def cmd_symbols(args: argparse.Namespace) -> None:
         strokes=args.strokes,
         emnist=args.emnist,
         emnist_per_class=args.emnist_per_class,
+        profile=args.profile,
         homus_copies=args.homus_copies,
         homus_brush=args.homus_brush,
         context_p=args.context_p,
@@ -633,6 +634,14 @@ def main(argv: list[str] | None = None) -> None:
         help="contributed pen strokes (JSON Lines from a score editor), split by contributor",
     )
     p.add_argument(
+        "--profile",
+        choices=("battuta", "kakigori"),
+        default=None,
+        help="class set of one consumer: battuta (the editor's stylus model, with "
+        "handwriting) or kakigori (every class, engraved only: no stroke templates, "
+        "--homus/--strokes/--emnist refused)",
+    )
+    p.add_argument(
         "--emnist",
         type=Path,
         default=None,
@@ -678,6 +687,7 @@ def main(argv: list[str] | None = None) -> None:
             "rest",
             "clef",
             "barline",
+            "navigation",
         ),
         help="symbol groups to include (default: all)",
     )

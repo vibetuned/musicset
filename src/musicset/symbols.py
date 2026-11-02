@@ -30,7 +30,9 @@ is kept in one split only, since identical engravings recur across scores.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import math
 import re
@@ -38,7 +40,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from functools import cache
+from functools import cache, lru_cache
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -58,8 +60,20 @@ from musicset.context import (
     SymbolContext,
     context_vector,
 )
-from musicset.emnist import EMNIST_SYMBOLS, compose_word, load_emnist
-from musicset.homus import Stroke, StrokeSample, load_homus, stroke_fraction
+from musicset.emnist import (
+    EMNIST_SIGNS,
+    EMNIST_SYMBOLS,
+    compose_sign,
+    compose_word,
+    load_emnist,
+)
+from musicset.homus import (
+    Stroke,
+    StrokeSample,
+    compose_homus_codas,
+    load_homus,
+    stroke_fraction,
+)
 from musicset.parallel import map_pool
 from musicset.pipeline import PAGE_SUFFIX, page_file_stem
 from musicset.strokes import load_stroke_contributions
@@ -75,6 +89,7 @@ SYMBOL_GROUPS = (
     "rest",
     "clef",
     "barline",
+    "navigation",
 )
 PRESETS = ("mixed", "tablet", "score", "clean")
 
@@ -102,6 +117,8 @@ class SymbolSpec:
     """Whether a stylus stroke template is also available for tablet synthesis."""
     compose: tuple[str, str] | None = None
     """Time signature drawn from stacked SMuFL digits, ``(numerator, denominator)``."""
+    text: tuple[str, ...] = ()
+    """Strings that also render the class in Verovio's text font (``D.S.``, ``Fine``)."""
 
 
 SYMBOLS: tuple[SymbolSpec, ...] = (
@@ -281,9 +298,60 @@ SYMBOLS: tuple[SymbolSpec, ...] = (
     SymbolSpec("cClef", "clef", ("E05C",), scale_range=(0.58, 0.84)),
     # Barline: drawn as a bar, Verovio engraves it as a line rather than a glyph
     SymbolSpec("barlineSingle", "barline", (), scale_range=(0.58, 0.86)),
+    # Navigation marks: D.S. and D.C. as SMuFL glyphs or set in Verovio's text font,
+    # Fine in the text font only, the segno and coda signs
+    SymbolSpec(
+        "dalSegno", "navigation", ("E045",), scale_range=(0.62, 0.88), text=("D.S.", "D. S.")
+    ),
+    SymbolSpec("daCapo", "navigation", ("E046",), scale_range=(0.62, 0.88), text=("D.C.", "D. C.")),
+    SymbolSpec("fine", "navigation", (), scale_range=(0.58, 0.86), text=("Fine",)),
+    SymbolSpec("segno", "navigation", ("E047",), scale_range=(0.62, 0.88)),
+    SymbolSpec("coda", "navigation", ("E048",), scale_range=(0.60, 0.86)),
 )
 
 SYMBOL_BY_NAME: dict[str, SymbolSpec] = {s.name: s for s in SYMBOLS}
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolProfile:
+    """The class set one consumer of the dataset needs."""
+
+    name: str
+    classes: tuple[str, ...]
+    """In catalog order."""
+    handwriting: bool
+    """Whether stylus stroke templates, HOMUS and EMNIST belong in its builds."""
+
+
+BATTUTA_DROPPED: dict[str, str] = {
+    "accidentalDoubleSharp": "too rare to be worth a pen gesture",
+    "accidentalDoubleFlat": "too rare to be worth a pen gesture",
+    "dynamicMezzo": "only written inside mp / mf",
+    "dynamicZ": "only written inside sfz / fz",
+    "pedal": "not drawn by hand in the editor",
+    "note32nd": "too short for pen input",
+    "note64th": "too short for pen input",
+    "restWholeHalf": "the editor infers a rest's duration from the measure",
+    "rest8th": "the editor infers a rest's duration from the measure",
+    "rest16th": "the editor infers a rest's duration from the measure",
+    "rest32nd": "the editor infers a rest's duration from the measure",
+    "rest64th": "the editor infers a rest's duration from the measure",
+    "barlineSingle": "the editor draws barlines itself",
+}
+"""Catalog classes the Battuta editor's stylus model leaves out, and why. ``restQuarter``
+stays as the one rest gesture."""
+
+SYMBOL_PROFILES: dict[str, SymbolProfile] = {
+    "kakigori": SymbolProfile("kakigori", tuple(s.name for s in SYMBOLS), handwriting=False),
+    "battuta": SymbolProfile(
+        "battuta",
+        tuple(s.name for s in SYMBOLS if s.name not in BATTUTA_DROPPED),
+        handwriting=True,
+    ),
+}
+"""``kakigori``: every class, engraved only (fonts and score crops), for resolving the
+OMR detector's merged classes. ``battuta``: the stylus set of the Battuta editor, with
+real handwriting (HOMUS, EMNIST, contributions)."""
 
 # Element classes in PageAnnotation that map directly to a symbol class
 _ELEMENT_SYMBOLS = frozenset(("trill", "mordent", "turn", "fermata", "arpeg", "pedal"))
@@ -322,18 +390,27 @@ _GLYPH_TO_SYMBOL: dict[str, str] = {
         "rest",
         "clef",
         "timesig",
+        "navigation",
     )
     for code in spec.codes
 }
 
 
-def symbol_specs(groups: Sequence[str] = SYMBOL_GROUPS) -> tuple[SymbolSpec, ...]:
-    """Symbol specs belonging to ``groups`` in canonical order."""
+def symbol_specs(
+    groups: Sequence[str] = SYMBOL_GROUPS, classes: Sequence[str] | None = None
+) -> tuple[SymbolSpec, ...]:
+    """Symbol specs belonging to ``groups`` (and to ``classes`` when given) in canonical
+    order."""
     unknown = set(groups) - set(SYMBOL_GROUPS)
     if unknown:
         raise ValueError(f"unknown symbol group(s) {sorted(unknown)}: {SYMBOL_GROUPS}")
+    if classes is not None:
+        bad = set(classes) - set(SYMBOL_BY_NAME)
+        if bad:
+            raise ValueError(f"unknown symbol class(es) {sorted(bad)}")
     wanted = set(groups)
-    return tuple(s for s in SYMBOLS if s.group in wanted)
+    keep = None if classes is None else set(classes)
+    return tuple(s for s in SYMBOLS if s.group in wanted and (keep is None or s.name in keep))
 
 
 # =============================================================================
@@ -437,6 +514,70 @@ def _barline_contours() -> list[tuple[np.ndarray, int]]:
     """A single barline: a bar 8% as wide as it is tall."""
     pts = np.array([[0.0, 0.0], [80.0, 0.0], [80.0, 1000.0], [0.0, 1000.0]], dtype=np.float64)
     return [(pts, 1)]
+
+
+@lru_cache(maxsize=1)
+def _text_faces() -> tuple[bytes, ...]:
+    """Verovio's text font, Liberation (regular, bold, italic, bold italic), decoded from
+    the WOFF2 data its ``Liberation.css`` embeds: the face page crops of ``D.C.`` or
+    ``Fine`` were set in."""
+    css = (verovio_data_dir() / "Liberation.css").read_text()
+    faces = tuple(base64.b64decode(m) for m in re.findall(r"base64,([A-Za-z0-9+/=]+)", css))
+    if not faces:
+        raise FileNotFoundError(f"no embedded font in {verovio_data_dir() / 'Liberation.css'}")
+    return faces
+
+
+@lru_cache(maxsize=8)
+def _text_font(face: int, size: int = 96) -> Any:
+    from PIL import ImageFont
+
+    return ImageFont.truetype(io.BytesIO(_text_faces()[face]), size)
+
+
+def _rasterize_text(
+    text: str, canvas: int, target_fraction: float, rng: np.random.Generator, *, jitter: float
+) -> np.ndarray:
+    """``text`` in a random Liberation face on a ``(canvas, canvas)`` float32 image
+    (1.0=paper, 0.0=ink), its longer side spanning ``target_fraction``, with the same
+    rotation, scale and shear jitter as :func:`_rasterize_contours`."""
+    font = _text_font(int(rng.integers(len(_text_faces()))))
+    left, top, right, bottom = font.getbbox(text)
+    img = Image.new("L", (right - left + 24, bottom - top + 24), 255)
+    ImageDraw.Draw(img).text((12 - left, 12 - top), text, font=font, fill=0)
+    if jitter > 0:
+        angle = math.degrees(float(rng.uniform(-0.18, 0.18) * jitter))
+        img = img.rotate(angle, resample=Image.Resampling.BILINEAR, expand=True, fillcolor=255)
+        shear = float(rng.uniform(-0.14, 0.14) * jitter)
+        w, h = img.size
+        extra = round(abs(shear) * h)
+        img = img.transform(
+            (w + extra, h),
+            Image.Transform.AFFINE,
+            (1.0, shear, -extra if shear > 0 else 0.0, 0.0, 1.0, 0.0),
+            resample=Image.Resampling.BILINEAR,
+            fillcolor=255,
+        )
+    ink = np.asarray(img, dtype=np.uint8)
+    rows = np.flatnonzero((ink < 128).any(axis=1))
+    cols = np.flatnonzero((ink < 128).any(axis=0))
+    if not len(rows):
+        return np.ones((canvas, canvas), dtype=np.float32)
+    crop = img.crop((int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1))
+    sx = sy = 1.0
+    if jitter > 0:
+        sx = float(rng.uniform(1.0 - 0.14 * jitter, 1.0 + 0.14 * jitter))
+        sy = float(rng.uniform(1.0 - 0.14 * jitter, 1.0 + 0.14 * jitter))
+    scale = canvas * target_fraction / max(crop.width * sx, crop.height * sy)
+    tw = max(1, min(canvas, round(crop.width * sx * scale)))
+    th = max(1, min(canvas, round(crop.height * sy * scale)))
+    glyph = crop.resize((tw, th), Image.Resampling.BILINEAR)
+    page = Image.new("L", (canvas, canvas), 255)
+    shift = canvas * 0.04 * jitter
+    x = round((canvas - tw) / 2 + float(rng.uniform(-shift, shift)))
+    y = round((canvas - th) / 2 + float(rng.uniform(-shift, shift)))
+    page.paste(glyph, (max(0, min(canvas - tw, x)), max(0, min(canvas - th, y))))
+    return np.asarray(page, dtype=np.float32) / 255.0
 
 
 def _rasterize_contours(
@@ -896,9 +1037,11 @@ def render_symbol_with_source(
     strength: float = 1.0,
     invert: bool = False,
     rng: np.random.Generator | int | None = None,
+    stroke_templates: bool = True,
 ) -> tuple[np.ndarray, int]:
     """:func:`render_symbol` plus the sample's source: ``SOURCE_STROKE`` when a
-    stylus stroke template was drawn, else ``SOURCE_FONT``.
+    stylus stroke template was drawn, else ``SOURCE_FONT``. ``stroke_templates=False``
+    never draws one (an engraved-only build).
     """
     if preset not in PRESETS:
         raise ValueError(f"unknown preset {preset!r}: {PRESETS}")
@@ -911,7 +1054,8 @@ def render_symbol_with_source(
     fraction = float(gen.uniform(lo, hi))
 
     use_strokes = (
-        spec.handwritten
+        stroke_templates
+        and spec.handwritten
         and preset != "clean"
         and gen.random() < (0.55 if preset == "tablet" else 0.35 if preset == "mixed" else 0.15)
     )
@@ -930,6 +1074,9 @@ def render_symbol_with_source(
         raw = _rasterize_contours(contours, canvas, fraction, gen, jitter=jitter)
     elif spec.name == "barlineSingle":
         raw = _rasterize_contours(_barline_contours(), canvas, fraction, gen, jitter=jitter)
+    elif spec.text and (not spec.codes or gen.random() < 0.6):
+        text = spec.text[int(gen.integers(len(spec.text)))]
+        raw = _rasterize_text(text, canvas, fraction, gen, jitter=jitter)
     else:
         candidates = [pair for code in spec.codes for pair in _available_font_codes(code)]
         font, code = candidates[int(gen.integers(len(candidates)))]
@@ -998,15 +1145,34 @@ def render_ink_sample(
     return (255 - resized) if invert else resized
 
 
-EmnistTask = tuple[tuple[np.ndarray, ...], float, float, int, float, bool, int, int, bool]
+EmnistTask = tuple[
+    tuple[np.ndarray, ...], str, bool, float, float, int, float, bool, int, int, bool
+]
+
+_NO_GLYPH = np.zeros((0, 0), dtype=np.uint8)
+"""Placeholder glyph for a character EMNIST lacks and :func:`compose_word` draws (``.``)."""
+
+
+def _pick_emnist(
+    pool: dict[str, np.ndarray], options: str, rng: np.random.Generator, where: str
+) -> np.ndarray:
+    """A random EMNIST image of any character in ``options`` (``.``: the placeholder)."""
+    if options == ".":
+        return _NO_GLYPH
+    avail = [c for c in options if c in pool and len(pool[c])]
+    if not avail:
+        raise ValueError(f"EMNIST {where} file has none of {options!r}")
+    c = avail[int(rng.integers(len(avail)))]
+    return pool[c][int(rng.integers(len(pool[c])))]
 
 
 def _render_emnist_task(task: EmnistTask) -> np.ndarray:
-    """One EMNIST sample: the word's glyphs composed, then placed like a stylus template
-    (augmented at a jittered size for ``train``, clean otherwise)."""
-    glyphs, lo, hi, size, strength, invert, seed, j, train = task
+    """One EMNIST sample: the word's glyphs composed (or the coda's circle and cross
+    overlaid), then placed like a stylus template (augmented at a jittered size for
+    ``train``, clean otherwise)."""
+    glyphs, text, overlay, lo, hi, size, strength, invert, seed, j, train = task
     rng = np.random.default_rng([seed, 5, j])
-    word = compose_word(glyphs, rng)
+    word = compose_sign(text, glyphs, rng) if overlay else compose_word(glyphs, rng, chars=text)
     if train:
         return render_ink_sample(
             word,
@@ -1037,12 +1203,20 @@ def _run_tasks[A, T](
         yield outcome.value
 
 
-def _render_task(task: tuple[str, int, str, float, bool, int, int, int]) -> tuple[np.ndarray, int]:
+def _render_task(
+    task: tuple[str, int, str, float, bool, int, int, int, bool],
+) -> tuple[np.ndarray, int]:
     """One synthetic sample ``(image, source)``; seeded by ``(seed, class, k)``."""
-    name, size, preset, strength, invert, seed, cls_idx, k = task
+    name, size, preset, strength, invert, seed, cls_idx, k, templates = task
     rng = np.random.default_rng([seed, cls_idx, k])
     return render_symbol_with_source(
-        name, size=size, preset=preset, strength=strength, invert=invert, rng=rng
+        name,
+        size=size,
+        preset=preset,
+        strength=strength,
+        invert=invert,
+        rng=rng,
+        stroke_templates=templates,
     )
 
 
@@ -1092,11 +1266,13 @@ def _generate_symbol_samples(
     invert: bool = False,
     seed: int = 0,
     workers: int | None = 1,
+    classes: Sequence[str] | None = None,
+    stroke_templates: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
-    specs = symbol_specs(groups)
+    specs = symbol_specs(groups, classes)
     class_names = tuple(s.name for s in specs)
     tasks = [
-        (spec.name, size, preset, strength, invert, seed, cls_idx, k)
+        (spec.name, size, preset, strength, invert, seed, cls_idx, k, stroke_templates)
         for cls_idx, spec in enumerate(specs)
         for k in range(samples_per_class)
     ]
@@ -1245,6 +1421,24 @@ def _metersig_class(el: Element, glyphs: Sequence[Glyph]) -> str | None:
     return _TIMESIG_BY_COMPOSE.get((top, bot))
 
 
+_TEXT_MARKS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^d\.?\s*s\.?$", re.IGNORECASE), "dalSegno"),
+    (re.compile(r"^d\.?\s*c\.?$", re.IGNORECASE), "daCapo"),
+    (re.compile(r"^fine\.?$", re.IGNORECASE), "fine"),
+)
+"""Directions whose whole text is a navigation mark; ``D.C. al Fine`` and friends are
+left out, their box holds more than the mark."""
+
+
+def _text_mark_class(text: str) -> str | None:
+    """Navigation class of a ``dir`` / ``repeatMark`` text, or ``None``."""
+    flat = " ".join(text.split())
+    for pattern, cls in _TEXT_MARKS:
+        if pattern.match(flat):
+            return cls
+    return None
+
+
 def _standalone_note_class(
     el: Element, page: PageAnnotation, parts: Sequence[int], codes: set[str]
 ) -> str | None:
@@ -1359,6 +1553,8 @@ def page_symbol_boxes_with_context(
             cls = el.classes[0]
         elif el.classes[0] == "barLine" and (not el.refined or "barlineSingle" in el.refined):
             cls = "barlineSingle"
+        elif el.classes[0] in ("dir", "repeatMark") and el.text is not None:
+            cls = _text_mark_class(el.text)
         elif el.classes[0] == "dots" and _is_single_dot(el.bbox):
             # Verovio draws augmentation dots as plain circles, so there is no glyph to map;
             # a chord's dots share one tall box, which is skipped
@@ -1418,15 +1614,16 @@ def extract_page_symbols(
         arr = np.asarray(image)
         grey = arr.mean(axis=2).round().astype(np.uint8) if arr.ndim == 3 else arr.astype(np.uint8)
 
-    return [(cls, patch) for cls, patch, _ in _page_crops(page, grey, groups, size, invert)]
+    names = [s.name for s in symbol_specs(groups)]
+    return [(cls, patch) for cls, patch, _ in _page_crops(page, grey, names, size, invert)]
 
 
 def _page_crops(
-    page: PageAnnotation, grey: np.ndarray, groups: Sequence[str], size: int, invert: bool
+    page: PageAnnotation, grey: np.ndarray, classes: Sequence[str], size: int, invert: bool
 ) -> list[tuple[str, np.ndarray, np.ndarray]]:
-    """``(class, patch, context vector)`` crops of one page."""
+    """``(class, patch, context vector)`` crops of one page, for the named classes."""
     h, w = grey.shape[:2]
-    allowed = {s.name for s in symbol_specs(groups)}
+    allowed = set(classes)
     crops: list[tuple[str, np.ndarray, np.ndarray]] = []
     for cls, bbox, ctx in page_symbol_boxes_with_context(page, (w, h), allowed=allowed):
         patch = _crop_box_to_patch(grey, bbox, size, invert=invert)
@@ -1462,13 +1659,13 @@ def _extract_page_task(
     task: tuple[Path, Path, tuple[str, ...], int, bool],
 ) -> list[tuple[str, np.ndarray, str, np.ndarray]]:
     """``(class, patch, score, context)`` crops of one canonical ``pages/`` page."""
-    page_path, img_path, groups, size, invert = task
+    page_path, img_path, classes, size, invert = task
     page = PageAnnotation.load(page_path)
     with Image.open(img_path) as im:
         grey = np.asarray(im.convert("L"), dtype=np.uint8)
     return [
         (cls, patch, page.score, ctx)
-        for cls, patch, ctx in _page_crops(page, grey, groups, size, invert)
+        for cls, patch, ctx in _page_crops(page, grey, classes, size, invert)
     ]
 
 
@@ -1508,13 +1705,13 @@ def _extract_dataset_symbols(
     max_per_class: int = 0,
     seed: int = 0,
     workers: int | None = 1,
+    classes: Sequence[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray, np.ndarray]:
     roots = [dataset] if isinstance(dataset, Path) else list(dataset)
-    specs = symbol_specs(groups)
+    specs = symbol_specs(groups, classes)
     class_names = tuple(s.name for s in specs)
     class_to_idx = {name: i for i, name in enumerate(class_names)}
     allowed = frozenset(class_to_idx)
-    groups_t = tuple(groups)
 
     page_tasks: list[tuple[Path, Path, tuple[str, ...], int, bool]] = []
     ann_tasks: list[tuple[Path, Path, dict[str, str], frozenset[str], int, bool]] = []
@@ -1527,7 +1724,7 @@ def _extract_dataset_symbols(
             for page_path in page_files:
                 img_path = imgs_dir / f"{page_file_stem(page_path)}.png"
                 if img_path.exists():
-                    page_tasks.append((page_path, img_path, groups_t, size, invert))
+                    page_tasks.append((page_path, img_path, class_names, size, invert))
         elif ann_dir.is_dir():
             fing_ids = _fingering_id_map(pages_dir)
             for ann_path in sorted(ann_dir.glob("*.json")):
@@ -1750,6 +1947,7 @@ def build_symbol_dataset(
     strokes: Sequence[Path] = (),
     emnist: Path | None = None,
     emnist_per_class: int = 1000,
+    profile: str | None = None,
     homus_copies: int = 1,
     homus_brush: float = 0.0,
     context_p: float = 0.7,
@@ -1793,8 +1991,14 @@ def build_symbol_dataset(
       synthetic and crops), ``c_<split>`` context vectors, ``classes``);
 
     ``emnist`` (the directory of NIST's ``byclass`` files) adds ``emnist_per_class``
-    real handwritten words per fingering and dynamic class (:mod:`musicset.emnist`),
-    train and val from EMNIST's train file, test from its test file.
+    real handwritten words per fingering, dynamic and navigation class
+    (:mod:`musicset.emnist`), train and val from EMNIST's train file, test from its
+    test file. With ``homus`` and a ``coda`` class, each HOMUS writer also contributes
+    codas composed from their own strokes (:func:`musicset.homus.compose_homus_codas`).
+
+    ``profile`` (``SYMBOL_PROFILES``) narrows the classes to one consumer's set:
+    ``battuta`` for the editor's stylus model, ``kakigori`` for the OMR pipeline, which is
+    engraved only (no stroke templates, and ``homus`` / ``strokes`` / ``emnist`` refused).
     * ``out/labels.json`` (class list, index map, group map, build settings,
       per-class, per-split and per-source counts, removed samples);
     * ``out/strokes_<split>.json`` for HOMUS val/test samples;
@@ -1805,7 +2009,18 @@ def build_symbol_dataset(
     if samples_per_class == 0 and not from_dataset and homus is None and not strokes and not emnist:
         raise ValueError("need samples_per_class > 0, from_dataset, homus, strokes or emnist")
 
-    specs = symbol_specs(groups)
+    profile_classes: tuple[str, ...] | None = None
+    stroke_templates = True
+    if profile is not None:
+        if profile not in SYMBOL_PROFILES:
+            raise ValueError(f"unknown profile {profile!r}: {sorted(SYMBOL_PROFILES)}")
+        prof = SYMBOL_PROFILES[profile]
+        if not prof.handwriting and (homus is not None or strokes or emnist is not None):
+            raise ValueError(f"profile {profile!r} is engraved only: drop homus, strokes, emnist")
+        profile_classes, stroke_templates = prof.classes, prof.handwriting
+    specs = symbol_specs(groups, profile_classes)
+    if not specs:
+        raise ValueError(f"no class left in groups {list(groups)} for profile {profile!r}")
     class_names = tuple(s.name for s in specs)
     class_to_idx = {name: i for i, name in enumerate(class_names)}
     rng = np.random.default_rng(seed)
@@ -1843,6 +2058,8 @@ def build_symbol_dataset(
             invert=invert,
             seed=seed,
             workers=workers,
+            classes=profile_classes,
+            stroke_templates=stroke_templates,
         )
         m = inked_mask(sx)
         sx, sy, ss = sx[m], sy[m], ss[m]
@@ -1861,6 +2078,7 @@ def build_symbol_dataset(
             max_per_class=max_crops_per_class,
             seed=seed,
             workers=workers,
+            classes=profile_classes,
         )
         cs = np.full(len(cy), SOURCE_CROP, dtype=np.uint8)
         m = inked_mask(cx)
@@ -1875,8 +2093,10 @@ def build_symbol_dataset(
 
     if emnist is not None and emnist_per_class > 0:
         r_train, r_val, r_test = _normalized_ratios(split)
-        emnist_classes = [n for n in class_names if n in EMNIST_SYMBOLS]
-        chars = "".join(sorted({c for n in emnist_classes for w in EMNIST_SYMBOLS[n] for c in w}))
+        emnist_classes = [n for n in class_names if n in EMNIST_SYMBOLS or n in EMNIST_SIGNS]
+        wanted = {c for n in emnist_classes for w in EMNIST_SYMBOLS.get(n, ()) for c in w}
+        wanted |= {c for n in emnist_classes for cs in EMNIST_SIGNS.get(n, ()) for c in cs}
+        chars = "".join(sorted(wanted - {"."}))
         glyph_pools: dict[str, dict[str, np.ndarray]] = {}
         for file_split in ("train", "test"):
             xs, cs = load_emnist(emnist, file_split, chars=chars)
@@ -1888,17 +2108,37 @@ def build_symbol_dataset(
         ):
             em_tasks: list[EmnistTask] = []
             em_labels: list[int] = []
+            pool = glyph_pools[file_split]
+
             for cls_name in emnist_classes:
                 spec = SYMBOL_BY_NAME[cls_name]
-                words = EMNIST_SYMBOLS[cls_name]
-                pool = glyph_pools[file_split]
+                lo, hi = spec.scale_range
+                overlay = cls_name in EMNIST_SIGNS
                 for k in range(n_words):
                     j = class_to_idx[cls_name] * 1_000_000 + k + (500_000 if name == "test" else 0)
-                    word = words[int(rng.integers(len(words)))]
-                    glyphs = tuple(pool[c][int(rng.integers(len(pool[c])))] for c in word)
-                    lo, hi = spec.scale_range
+                    if overlay:
+                        word = cls_name
+                        glyphs = tuple(
+                            _pick_emnist(pool, cs, rng, file_split) for cs in EMNIST_SIGNS[cls_name]
+                        )
+                    else:
+                        words = EMNIST_SYMBOLS[cls_name]
+                        word = words[int(rng.integers(len(words)))]
+                        glyphs = tuple(_pick_emnist(pool, c, rng, file_split) for c in word)
                     em_tasks.append(
-                        (glyphs, lo, hi, size, strength, invert, seed, j, name == "train")
+                        (
+                            glyphs,
+                            word,
+                            overlay,
+                            lo,
+                            hi,
+                            size,
+                            strength,
+                            invert,
+                            seed,
+                            j,
+                            name == "train",
+                        )
                     )
                     em_labels.append(class_to_idx[cls_name])
             if not em_tasks:
@@ -1935,7 +2175,10 @@ def build_symbol_dataset(
 
     hand: list[StrokeSample] = []
     if homus is not None:
-        hand += [smp for smp in load_homus(homus) if smp.label in class_to_idx]
+        homus_samples = load_homus(homus)
+        hand += [smp for smp in homus_samples if smp.label in class_to_idx]
+        if "coda" in class_to_idx:
+            hand += compose_homus_codas(homus_samples, seed=seed)
     if strokes:
         hand += load_stroke_contributions(list(strokes), classes=set(class_to_idx))
     if hand:
@@ -2120,6 +2363,8 @@ def build_symbol_dataset(
     roots = [from_dataset] if isinstance(from_dataset, Path) else list(from_dataset or [])
 
     meta: dict[str, Any] = {
+        "profile": profile,
+        "stroke_templates": stroke_templates,
         "classes": list(class_names),
         "class_to_idx": {name: i for i, name in enumerate(class_names)},
         "groups": by_group,

@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from musicset.annotate.geometry import BBox
+from musicset.annotate.geometry import BBox, union
 from musicset.annotate.schema import PageAnnotation
 
 CONTEXT_FEATURES: tuple[str, ...] = (
@@ -52,26 +52,33 @@ Where the symbol sits on the staff:
 * ``x_measure``: position between the measure's barlines, left -1 to right 1;
 * ``barline``: distance to the nearest barline in staff spaces / 8, clipped.
 
-Where it sits relative to the nearest notehead (never the symbol's own):
+Where it sits relative to the nearest note, never the symbol's own. A note is its
+body: the bounding box of its notehead, stem and flag, or of every notehead plus the
+stem and flag of its chord, without accidentals, dots or articulations (an editor sees
+the note that way before the mark is added). The body's centre is the reference, so
+the offset no longer depends on whether the stem points up or down at the notehead:
 
-* ``has_note``: 1 when one lies within ``NOTE_RANGE`` staff spaces;
-* ``note_above`` / ``note_below``: the symbol is in the note's column, above or
-  below it (staccato, tenuto, accent, fingering);
-* ``note_left`` / ``note_right``: the symbol is beside the note (accidental on the
+* ``has_note``: 1 when a body lies within ``NOTE_RANGE`` staff spaces;
+* ``note_above`` / ``note_below``: the symbol centre is above the body's top or below
+  its bottom, within ``NOTE_MARGIN`` of its sides (staccato, tenuto, accent, fermata,
+  fingering);
+* ``note_left`` / ``note_right``: the centre is left of the body's left edge or right
+  of its right edge, within ``NOTE_MARGIN`` of its top and bottom (accidental on the
   left, augmentation dot on the right);
-* ``note_dx``, ``note_dy``: the exact offset, symbol centre minus note centre, / 8;
+* ``note_dx``, ``note_dy``: the exact offset, symbol centre minus body centre, / 8;
 
 and its size: ``width``, ``height`` in staff spaces / 8, clipped.
 """
 CONTEXT_DIM = len(CONTEXT_FEATURES)
 NOTE_RANGE = 8.0
-"""Staff spaces within which a notehead counts as the symbol's neighbour."""
+"""Staff spaces within which a note's body counts as the symbol's neighbour."""
 STAFF_HALF_HEIGHT = 2.0
 """Staff spaces from the middle line to the outer lines: the ``in_staff`` zone."""
-NOTE_SIDE = 0.5
-"""Offset in staff spaces beyond which the symbol counts as beside, above or below the note."""
-NOTE_COLUMN = 1.0
-"""Horizontal offset within which the symbol counts as in the note's column."""
+NOTE_MARGIN = 0.5
+"""Staff spaces a symbol may stick out past a body's sides and still count as above or
+below it (or past its top and bottom and still count as left or right of it)."""
+NOTE_BODY_PARTS = frozenset(("notehead", "stem", "flag"))
+"""Element kinds that make up a note's body."""
 NOTEHEAD_CODES = frozenset({"E0A0", "E0A1", "E0A2", "E0A3", "E0A4", "E0A5", "E0A9", "E0B3"})
 
 
@@ -85,8 +92,12 @@ class SymbolContext:
     barline: float
     note_dx: float | None
     note_dy: float | None
+    """Symbol centre minus the nearest note body's centre; ``None`` without one."""
     width: float
     height: float
+    note_w: float | None = None
+    note_h: float | None = None
+    """Width and height of that body (``None`` or 0: a point, e.g. an older record)."""
 
 
 def context_vector(ctx: SymbolContext | None) -> np.ndarray:
@@ -96,7 +107,10 @@ def context_vector(ctx: SymbolContext | None) -> np.ndarray:
     has_note = ctx.note_dx is not None and ctx.note_dy is not None
     dx = ctx.note_dx if ctx.note_dx is not None else 0.0
     dy = ctx.note_dy if ctx.note_dy is not None else 0.0
-    in_column = has_note and abs(dx) < NOTE_COLUMN
+    hw = 0.5 * (ctx.note_w or 0.0)
+    hh = 0.5 * (ctx.note_h or 0.0)
+    over = has_note and abs(dx) <= hw + NOTE_MARGIN
+    beside = has_note and abs(dy) <= hh + NOTE_MARGIN
     return np.array(
         [
             1.0,
@@ -107,10 +121,10 @@ def context_vector(ctx: SymbolContext | None) -> np.ndarray:
             max(-1.0, min(1.0, ctx.x_measure * 2.0 - 1.0)),
             max(0.0, min(1.0, ctx.barline / 8.0)),
             1.0 if has_note else 0.0,
-            1.0 if in_column and dy <= -NOTE_SIDE else 0.0,
-            1.0 if in_column and dy >= NOTE_SIDE else 0.0,
-            1.0 if has_note and dx <= -NOTE_SIDE else 0.0,
-            1.0 if has_note and dx >= NOTE_SIDE else 0.0,
+            1.0 if over and dy < -hh else 0.0,
+            1.0 if over and dy > hh else 0.0,
+            1.0 if beside and dx < -hw else 0.0,
+            1.0 if beside and dx > hw else 0.0,
             max(-1.0, min(1.0, dx / NOTE_RANGE)),
             max(-1.0, min(1.0, dy / NOTE_RANGE)),
             max(0.0, min(1.5, ctx.width / 8.0)),
@@ -127,7 +141,8 @@ def context_from_record(
 
     The dict carries ``y_staff`` (staff spaces from the middle line, down is
     positive), ``x_measure`` (0-1), ``barline`` (staff spaces), optional
-    ``note_dx`` / ``note_dy`` (staff spaces, ``null`` when no note is near) and
+    ``note_dx`` / ``note_dy`` (staff spaces from the nearest note body's centre,
+    ``null`` when no note is near) with that body's ``note_w`` / ``note_h``, and
     optionally ``width`` / ``height`` (staff spaces, else from the strokes).
     """
     raw = record.get("context")
@@ -141,6 +156,7 @@ def context_from_record(
     else:
         return None
     dx, dy = raw.get("note_dx"), raw.get("note_dy")
+    near = dx is not None and dy is not None
     return SymbolContext(
         y_staff=float(raw["y_staff"]),
         x_measure=float(raw.get("x_measure", 0.5)),
@@ -149,6 +165,8 @@ def context_from_record(
         note_dy=None if dy is None else float(dy),
         width=width,
         height=height,
+        note_w=float(raw.get("note_w") or 0.0) if near else None,
+        note_h=float(raw.get("note_h") or 0.0) if near else None,
     )
 
 
@@ -156,8 +174,39 @@ def _centre(b: BBox | Sequence[float]) -> tuple[float, float]:
     return 0.5 * (float(b[0]) + float(b[2])), 0.5 * (float(b[1]) + float(b[3]))
 
 
+def note_bodies(page: PageAnnotation) -> np.ndarray:
+    """``(N, 4)`` page-unit boxes of the page's note bodies: noteheads, stem and flag of
+    each note, or of each chord as a whole. Pages without note elements fall back to
+    their notehead glyphs."""
+    boxes: dict[int, BBox] = {}
+    for el in page.elements:
+        if el.bbox is None or not el.classes or el.classes[0] not in NOTE_BODY_PARTS:
+            continue
+        owner: int | None = None
+        cur = el.parent
+        while cur is not None:
+            anc = page.elements[cur]
+            kind = anc.classes[0] if anc.classes else ""
+            if kind == "chord":
+                owner = cur
+                break
+            if kind == "note" and owner is None:
+                owner = cur  # keep climbing: the note may belong to a chord
+            elif kind in ("layer", "staff", "measure"):
+                break
+            cur = anc.parent
+        merged = union(boxes.get(owner), el.bbox) if owner is not None else None
+        if owner is not None and merged is not None:
+            boxes[owner] = merged
+    if boxes:
+        return np.array(list(boxes.values()), dtype=np.float64).reshape(-1, 4)
+    return np.array(
+        [g.bbox for g in page.glyphs if g.code in NOTEHEAD_CODES and g.bbox], dtype=np.float64
+    ).reshape(-1, 4)
+
+
 class PageGeometry:
-    """Staves (five-line boxes), measures and noteheads of a page, for context lookups."""
+    """Staves (five-line boxes), measures and note bodies of a page, for context lookups."""
 
     def __init__(self, page: PageAnnotation) -> None:
         self.staves: list[BBox] = [
@@ -166,10 +215,7 @@ class PageGeometry:
         self.measures: list[BBox] = [
             e.bbox for e in page.elements if e.classes and e.classes[0] == "measure" and e.bbox
         ]
-        self.noteheads: np.ndarray = np.array(
-            [_centre(g.bbox) for g in page.glyphs if g.code in NOTEHEAD_CODES and g.bbox],
-            dtype=np.float64,
-        ).reshape(-1, 2)
+        self.notes: np.ndarray = note_bodies(page)
 
     def context(self, bbox: BBox | Sequence[float]) -> SymbolContext | None:
         """Context of a symbol box in page units, or ``None`` without a staff."""
@@ -199,22 +245,25 @@ class PageGeometry:
             x_measure = (cx - m[0]) / width
             barline = min(cx - m[0], m[2] - cx) / staff_space
 
-        note_dx = note_dy = None
-        if len(self.noteheads):
+        note_dx = note_dy = note_w = note_h = None
+        if len(self.notes):
             x1, y1, x2, y2 = (float(v) for v in bbox)
-            inside = (
-                (self.noteheads[:, 0] >= x1)
-                & (self.noteheads[:, 0] <= x2)
-                & (self.noteheads[:, 1] >= y1)
-                & (self.noteheads[:, 1] <= y2)
-            )
-            others = self.noteheads[~inside]
+            ncx = 0.5 * (self.notes[:, 0] + self.notes[:, 2])
+            ncy = 0.5 * (self.notes[:, 1] + self.notes[:, 3])
+            # a body centred inside the symbol's box is the symbol itself (a note crop)
+            own = (ncx >= x1) & (ncx <= x2) & (ncy >= y1) & (ncy <= y2)
+            others, ocx, ocy = self.notes[~own], ncx[~own], ncy[~own]
             if len(others):
-                d = np.hypot(others[:, 0] - cx, others[:, 1] - cy) / staff_space
-                k = int(np.argmin(d))
+                gap_x = np.maximum(np.maximum(others[:, 0] - cx, cx - others[:, 2]), 0.0)
+                gap_y = np.maximum(np.maximum(others[:, 1] - cy, cy - others[:, 3]), 0.0)
+                d = np.hypot(gap_x, gap_y) / staff_space
+                # nearest body edge first, nearest centre among bodies the symbol touches
+                k = int(np.argmin(d + 1e-3 * np.hypot(ocx - cx, ocy - cy) / staff_space))
                 if d[k] <= NOTE_RANGE:
-                    note_dx = (cx - others[k, 0]) / staff_space
-                    note_dy = (cy - others[k, 1]) / staff_space
+                    note_dx = (cx - ocx[k]) / staff_space
+                    note_dy = (cy - ocy[k]) / staff_space
+                    note_w = (others[k, 2] - others[k, 0]) / staff_space
+                    note_h = (others[k, 3] - others[k, 1]) / staff_space
 
         return SymbolContext(
             y_staff=y_staff,
@@ -224,6 +273,8 @@ class PageGeometry:
             note_dy=note_dy,
             width=(float(bbox[2]) - float(bbox[0])) / staff_space,
             height=(float(bbox[3]) - float(bbox[1])) / staff_space,
+            note_w=note_w,
+            note_h=note_h,
         )
 
 
@@ -238,13 +289,14 @@ def page_symbol_contexts(
 __all__ = [
     "CONTEXT_DIM",
     "CONTEXT_FEATURES",
-    "NOTE_COLUMN",
+    "NOTE_BODY_PARTS",
+    "NOTE_MARGIN",
     "NOTE_RANGE",
-    "NOTE_SIDE",
     "STAFF_HALF_HEIGHT",
     "PageGeometry",
     "SymbolContext",
     "context_from_record",
     "context_vector",
+    "note_bodies",
     "page_symbol_contexts",
 ]

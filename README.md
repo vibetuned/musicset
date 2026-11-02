@@ -308,8 +308,8 @@ octave clef mid-system; if they turn up, the fix is a `gClef8vaChange` /
 
 `musicset symbols OUT` builds an MNIST-like grayscale classification dataset
 (`32x32` by default, black ink on white paper; `--invert` for classic
-white-on-black, `--size` for `28`, `64`, ...) covering 51 score markings across
-ten groups (`--groups`):
+white-on-black, `--size` for `28`, `64`, ...) covering 56 score markings across
+eleven groups (`--groups`):
 
 - **fingering** (`fing1`..`fing5`): digits `1`–`5` only;
 - **ornament**: `trill`, `mordent`, `turn`, `fermata`, `arpeg`;
@@ -326,7 +326,19 @@ ten groups (`--groups`):
 - **rest**: `restWholeHalf` (one shape, two staff positions), `restQuarter`,
   `rest8th`, `rest16th`, `rest32nd`, `rest64th`;
 - **clef**: `gClef`, `fClef`, `cClef`;
-- **barline**: `barlineSingle`.
+- **barline**: `barlineSingle`;
+- **navigation**: `dalSegno` (D.S.), `daCapo` (D.C.), `fine`, `segno`, `coda`.
+
+`--profile` narrows the catalog to one consumer's set (`musicset.SYMBOL_PROFILES`):
+
+- **kakigori**: every class, engraved only (fonts and score crops; no stroke
+  templates, and `--homus`, `--strokes`, `--emnist` are refused), for the OMR
+  pipeline that resolves the detector's merged classes;
+- **battuta**: the 43 classes a stylus user draws in the Battuta editor, with
+  real handwriting. It leaves out every rest but `restQuarter` (the editor
+  infers a rest's duration from the measure), the double accidentals (rare),
+  `dynamicMezzo` and `dynamicZ` (only parts of `mp`, `mf`, `sfz`), `pedal`,
+  `note32nd`, `note64th` and `barlineSingle` (`BATTUTA_DROPPED` says why for each).
 
 ```bash
 # Synthetic (SMuFL fonts + stylus stroke templates with elastic/tablet/scan augmentation)
@@ -340,6 +352,11 @@ uv run musicset symbols data/symbols -n 300 --homus ~/data/HOMUS.zip --homus-cop
 
 # Add real handwritten digits and letters (EMNIST byclass) for the fingerings and dynamics
 uv run musicset symbols data/symbols -n 300 --emnist ~/data/emnist --emnist-per-class 1000
+
+# The two consumer sets
+uv run musicset symbols data/symbols-battuta --profile battuta -n 2000 \
+    --from-dataset data/piano --homus ~/data/HOMUS.zip --homus-copies 2 --emnist ~/data/emnist
+uv run musicset symbols data/symbols-kakigori --profile kakigori -n 2000 --from-dataset data/piano
 ```
 
 Writes both `dataset.npz` (`x_train`, `y_train`, `s_train`, `x_val`, ...,
@@ -356,29 +373,52 @@ val/test samples are rendered once, deterministically, at their natural size,
 and their raw strokes are kept in `strokes_val.json` / `strokes_test.json` for
 stroke-level tests.
 
-HOMUS has no fingerings or dynamics, so `--emnist DIR` (the directory of NIST's
-`emnist-byclass-*` files, `musicset.emnist`) composes them from real handwritten
-characters: a digit `1`–`5` per fingering, the letters of `p`, `mp`, `sfz`, ...
-per dynamic, glued with a random gap and baseline jitter, then placed on the
-canvas like a stylus template. Train and val words come from EMNIST's train
-file, test words from its test file (other writers), `--emnist-per-class` words
-per class for train plus val.
+HOMUS has no fingerings, dynamics or navigation marks, so `--emnist DIR` (the
+directory of NIST's `emnist-byclass-*` files, `musicset.emnist`) composes them
+from real handwritten characters: a digit `1`–`5` per fingering, the letters of
+`p`, `mp`, `sfz`, ... per dynamic and of `D.S.`, `D.C.`, `Fine`, glued on a
+common baseline with lowercase letters at their x-height and descenders below it
+(EMNIST scales every character to the same box) and the periods drawn. Three
+signs are built from characters: the coda is an `O` crossed by an `X` turned
+upright, the segno an `S` slashed by a `1` laid diagonally with two dots, and the
+turn an `S` mirrored and laid on its side (a plain `S` on its side is the
+inverted turn). Each result is placed on the canvas like a stylus template. Train
+and val words come from EMNIST's train file, test words from its test file
+(other writers), `--emnist-per-class` words per class for train plus val. With
+`--homus` and a `coda` class, every HOMUS writer also draws codas from their own
+strokes, one of their whole-note ovals crossed by two of their barlines
+(`musicset.homus.compose_homus_codas`), so the writer split still holds.
+
+Engraved `D.S.`, `D.C.` and `Fine` are rendered from the SMuFL `dalSegno` /
+`daCapo` glyphs and in Liberation, the text font Verovio embeds and sets
+directions in. Score crops of them come from `dir` elements whose whole text is
+the mark (`D.C. al Fine` is left out, its box holds more than the mark).
 
 `c_<split>` is the **conditioning vector** (`musicset.context`): where the
 symbol sits in the score, in staff spaces, so the same pen mark can be read
 differently in different places (a dot beside a notehead is an augmentation
 dot, above it a staccato). Score crops carry their real context from the page
-geometry (`system-staff` lines, measures, neighbouring noteheads), editor
+geometry (`system-staff` lines, measures, neighbouring notes), editor
 contributions the one their editor recorded, and every other sample, with
 probability `--context-p`, one drawn from the real contexts of training crops
 of its class, else "unknown" (all zeros). `labels.json` lists the feature names
 and which classes have a context pool.
 
+The note features describe the nearest note's **body**: the bounding box of its
+notehead, stem and flag, or of every notehead plus the stem and flag of its
+chord, without accidentals, dots or articulations (the note as an editor shows
+it before the mark is added). `note_dx` / `note_dy` are the symbol's centre
+minus the body's centre, so they do not depend on which way the stem points
+from the notehead; `note_above` / `note_below` say the centre is above the
+body's top or below its bottom (within half a staff space of its sides), and
+`note_left` / `note_right` that it is left or right of its sides (within half a
+space of its top and bottom).
+
 Editor contributions (`--strokes`, see `musicset.strokes`) are JSON Lines with
 `label`, an opaque `writer`, the editor's `staff_space` (pixels between two
 staff lines, which fixes the drawing's natural size), the `strokes`, and
 optionally a `context` dict with `y_staff`, `x_measure`, `barline`, `note_dx`,
-`note_dy` in staff spaces. Contributors never straddle splits. Synthetic samples are split per class at random; score
+`note_dy` and the body's `note_w`, `note_h` in staff spaces. Contributors never straddle splits. Synthetic samples are split per class at random; score
 crops are split **by score**, never straddling splits. Patches with fewer than
 `--min-ink` ink pixels are dropped, and a byte-identical image is kept in one
 split only (`--no-dedup` to disable), since identical engravings of e.g. a
